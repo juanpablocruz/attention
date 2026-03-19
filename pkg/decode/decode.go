@@ -1,6 +1,7 @@
 package decode
 
 import (
+	"context"
 	"io"
 	"log"
 	"sync"
@@ -8,13 +9,16 @@ import (
 	"github.com/juanpablocruz/attention/gen/internal/output"
 )
 
-const RecordSize = 10
+const RecordSize = output.RecordSize
 
 type OutputProcesser interface {
 	Process(output.Output)
 }
 
-func DecodeOutput(workers, totalRecords int64, wg *sync.WaitGroup, f io.ReaderAt, process OutputProcesser) {
+func DecodeOutput(ctx context.Context, workers, totalRecords int64, wg *sync.WaitGroup, f io.ReaderAt, process OutputProcesser) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	recordsPerWorker := totalRecords / workers
 	for w := range workers {
@@ -32,6 +36,12 @@ func DecodeOutput(workers, totalRecords int64, wg *sync.WaitGroup, f io.ReaderAt
 			buf := make([]byte, batchRecords*RecordSize)
 
 			for current := startRecord; current < endRecord; {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
 				remaining := endRecord - current
 
 				nrecs := min(remaining, int64(batchRecords))
@@ -47,6 +57,12 @@ func DecodeOutput(workers, totalRecords int64, wg *sync.WaitGroup, f io.ReaderAt
 				}
 
 				for i := range nrecs {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
 					start := i * RecordSize
 					end := start + RecordSize
 					out := output.DecodeRecord(chunk[start:end])

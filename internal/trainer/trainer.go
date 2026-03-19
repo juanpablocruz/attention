@@ -1,9 +1,11 @@
 package trainer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	lossfn "github.com/juanpablocruz/attention/gen/internal/loss"
 	"github.com/juanpablocruz/attention/gen/internal/matrix"
 	"github.com/juanpablocruz/attention/gen/internal/output"
+	"github.com/juanpablocruz/attention/gen/internal/prompt"
 	"github.com/juanpablocruz/attention/gen/internal/transformer"
 	"github.com/juanpablocruz/attention/gen/pkg/decode"
 )
@@ -19,10 +22,13 @@ import (
 const (
 	defaultEpochs       = 3
 	defaultCheckpoint   = "./checkpoints/embed_model.bin"
-	defaultVocabSize    = 10
+	defaultVocabSize    = prompt.VocabSize
 	defaultModelDim     = 32
 	defaultLearningRate = float32(0.01)
-	defaultBatchSize    = 64
+	defaultBatchSize    = 256
+	progressInterval    = 2 * time.Second
+	envBatchSize        = "ATTN_BATCH_SIZE"
+	envGradWorkers      = "ATTN_GRAD_WORKERS"
 )
 
 type Config struct {
@@ -53,7 +59,8 @@ type EpochMetrics struct {
 }
 
 type outputSink struct {
-	ch chan<- output.Output
+	ctx context.Context
+	ch  chan<- output.Output
 }
 
 type sampleGrad struct {
@@ -69,11 +76,39 @@ type sampleGrad struct {
 	dEmbedding *matrix.Matrix
 }
 
-func (s *outputSink) Process(o output.Output) {
-	s.ch <- o
+type batchWork struct {
+	samples []output.Output
+	resp    chan<- workerBatchAccum
 }
 
-func Train(cfg Config) (bool, []EpochMetrics, error) {
+type workerBatchAccum struct {
+	err        error
+	loss       float64
+	correct    int64
+	tokens     int64
+	count      int
+	dCW        *matrix.Matrix
+	dW1        *matrix.Matrix
+	dW2        *matrix.Matrix
+	dWQ        *matrix.Matrix
+	dWK        *matrix.Matrix
+	dWV        *matrix.Matrix
+	dEmbedding *matrix.Matrix
+}
+
+func (s *outputSink) Process(o output.Output) {
+	select {
+	case <-s.ctx.Done():
+		return
+	case s.ch <- o:
+	}
+}
+
+func Train(ctx context.Context, cfg Config) (bool, []EpochMetrics, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	cfg = normalizeConfig(cfg)
 
 	m := embbeding.New(cfg.VocabSize, cfg.ModelDim)
@@ -82,19 +117,28 @@ func Train(cfg Config) (bool, []EpochMetrics, error) {
 
 	loaded, err := checkpoint.Load(cfg.CheckpointPath, m, tBlock, cW)
 	if err != nil {
-		return false, nil, err
+		loaded = false
 	}
 
 	metrics := make([]EpochMetrics, 0, cfg.Epochs)
+	interrupted := false
 	for epoch := 1; epoch <= cfg.Epochs; epoch++ {
+		if ctx.Err() != nil {
+			interrupted = true
+			break
+		}
+
 		start := time.Now()
-		avgLoss, tokenAcc, seen, err := trainEpoch(cfg.DatasetPath, m, tBlock, cW, cfg.LearningRate, cfg.ModelDim, cfg.BatchSize, cfg.GradWorkers)
+		avgLoss, tokenAcc, seen, canceled, err := trainEpoch(ctx, epoch, cfg.Epochs, cfg.DatasetPath, m, tBlock, cW, cfg.LearningRate, cfg.ModelDim, cfg.BatchSize, cfg.GradWorkers)
 		if err != nil {
-			return loaded, nil, err
+			return loaded, nil, interrupted, err
+		}
+		if canceled {
+			interrupted = true
 		}
 
 		if err := checkpoint.Save(cfg.CheckpointPath, m, tBlock, cW); err != nil {
-			return loaded, nil, err
+			return loaded, nil, interrupted, err
 		}
 
 		metrics = append(metrics, EpochMetrics{
@@ -105,9 +149,13 @@ func Train(cfg Config) (bool, []EpochMetrics, error) {
 			TokenAcc:    tokenAcc,
 			Elapsed:     time.Since(start),
 		})
+
+		if canceled {
+			break
+		}
 	}
 
-	return loaded, metrics, nil
+	return loaded, metrics, interrupted, nil
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -135,22 +183,33 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.GradWorkers < 1 {
 		cfg.GradWorkers = 1
 	}
+	if v := os.Getenv(envBatchSize); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			cfg.BatchSize = parsed
+		}
+	}
+	if v := os.Getenv(envGradWorkers); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			cfg.GradWorkers = parsed
+		}
+	}
+
 	return cfg
 }
 
-func trainEpoch(datasetPath string, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, batchSize, gradWorkers int) (float64, float64, int64, error) {
+func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, batchSize, gradWorkers int) (float64, float64, int64, bool, error) {
 	f, totalRecords, workers, err := openDataset(datasetPath)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	defer f.Close()
 
 	outs := make(chan output.Output, 4096)
-	proc := &outputSink{ch: outs}
+	proc := &outputSink{ctx: ctx, ch: outs}
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
-	decode.DecodeOutput(int64(workers), totalRecords, &wg, f, proc)
+	decode.DecodeOutput(ctx, int64(workers), totalRecords, &wg, f, proc)
 
 	go func() {
 		wg.Wait()
@@ -163,15 +222,84 @@ func trainEpoch(datasetPath string, m *embbeding.Embedding, tBlock *transformer.
 	var seen int64
 	batch := make([]output.Output, 0, batchSize)
 
-	for out := range outs {
+	workCh := make(chan batchWork, gradWorkers)
+	var gradWG sync.WaitGroup
+	gradWG.Add(gradWorkers)
+	for range gradWorkers {
+		go func() {
+			defer gradWG.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case work, ok := <-workCh:
+					if !ok {
+						return
+					}
+
+					accum := newWorkerBatchAccum(m, tBlock, cW)
+					for _, out := range work.samples {
+						if ctx.Err() != nil {
+							accum.err = ctx.Err()
+							break
+						}
+
+						sourceTokens, err := prompt.Encode(out.Prompt)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						targetTokens, err := prompt.Encode(out.Target)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						grad, err := computeSampleGrad(sourceTokens[:], targetTokens[:], m, tBlock, cW, modelDim)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						accum.add(grad)
+					}
+					work.resp <- accum
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(workCh)
+		gradWG.Wait()
+	}()
+	epochStart := time.Now()
+	lastReport := epochStart
+	spinner := []rune{'|', '/', '-', '\\'}
+	spinnerIdx := 0
+	didReport := false
+
+	canceled := false
+	for {
+		if ctx.Err() != nil {
+			canceled = true
+			break
+		}
+
+		out, ok := <-outs
+		if !ok {
+			break
+		}
+
 		batch = append(batch, out)
 		if len(batch) < batchSize {
 			continue
 		}
 
-		batchLoss, batchCorrect, batchTokens, err := trainBatch(batch, m, tBlock, cW, learningRate, modelDim, gradWorkers)
+		batchLoss, batchCorrect, batchTokens, err := trainBatch(ctx, batch, m, tBlock, cW, learningRate, modelDim, gradWorkers, workCh)
 		if err != nil {
-			return 0, 0, 0, err
+			if err == context.Canceled {
+				canceled = true
+				break
+			}
+			return 0, 0, 0, canceled, err
 		}
 
 		totalLoss += batchLoss
@@ -179,109 +307,152 @@ func trainEpoch(datasetPath string, m *embbeding.Embedding, tBlock *transformer.
 		totalTokens += batchTokens
 		seen += int64(len(batch))
 		batch = batch[:0]
+
+		now := time.Now()
+		if now.Sub(lastReport) >= progressInterval {
+			avgLoss := totalLoss / float64(max(seen, 1))
+			tokenAcc := float64(totalCorrect) / float64(max(totalTokens, 1))
+			percent := 100.0 * float64(seen) / float64(totalRecords)
+			elapsed := now.Sub(epochStart)
+			rate := float64(seen) / elapsed.Seconds()
+			remaining := float64(totalRecords-seen) / maxFloat(rate, 1e-9)
+			eta := time.Duration(remaining * float64(time.Second))
+
+			fmt.Printf("\r%c epoch=%d/%d progress=%.2f%% samples=%d/%d loss=%.6f token_acc=%.4f speed=%.0f/s eta=%s", spinner[spinnerIdx], epoch, totalEpochs, percent, seen, totalRecords, avgLoss, tokenAcc, rate, eta.Round(time.Second))
+			spinnerIdx = (spinnerIdx + 1) % len(spinner)
+			lastReport = now
+			didReport = true
+		}
 	}
 
 	if len(batch) > 0 {
-		batchLoss, batchCorrect, batchTokens, err := trainBatch(batch, m, tBlock, cW, learningRate, modelDim, gradWorkers)
+		batchLoss, batchCorrect, batchTokens, err := trainBatch(ctx, batch, m, tBlock, cW, learningRate, modelDim, gradWorkers, workCh)
 		if err != nil {
-			return 0, 0, 0, err
+			if err == context.Canceled {
+				canceled = true
+			} else {
+				return 0, 0, 0, canceled, err
+			}
+		} else {
+			totalLoss += batchLoss
+			totalCorrect += batchCorrect
+			totalTokens += batchTokens
+			seen += int64(len(batch))
 		}
+	}
 
-		totalLoss += batchLoss
-		totalCorrect += batchCorrect
-		totalTokens += batchTokens
-		seen += int64(len(batch))
+	if didReport {
+		fmt.Print("\n")
 	}
 
 	if seen == 0 {
-		return 0, 0, 0, fmt.Errorf("dataset has no records")
+		if canceled {
+			return 0, 0, 0, true, nil
+		}
+		return 0, 0, 0, canceled, fmt.Errorf("dataset has no records")
 	}
 
-	return totalLoss / float64(seen), float64(totalCorrect) / float64(totalTokens), seen, nil
+	return totalLoss / float64(seen), float64(totalCorrect) / float64(totalTokens), seen, canceled, nil
 }
 
-func trainBatch(batch []output.Output, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, gradWorkers int) (float64, int64, int64, error) {
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func trainBatch(ctx context.Context, batch []output.Output, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, gradWorkers int, workCh chan<- batchWork) (float64, int64, int64, error) {
 	workerCount := max(min(gradWorkers, len(batch)), 1)
+	respCh := make(chan workerBatchAccum, workerCount)
 
-	jobs := make(chan output.Output, len(batch))
-	results := make(chan *sampleGrad, len(batch))
-	errCh := make(chan error, 1)
+	start := 0
+	for w := 0; w < workerCount; w++ {
+		remainingWorkers := workerCount - w
+		remainingSamples := len(batch) - start
+		chunkSize := (remainingSamples + remainingWorkers - 1) / remainingWorkers
+		end := start + chunkSize
+		select {
+		case <-ctx.Done():
+			return 0, 0, 0, context.Canceled
+		case workCh <- batchWork{samples: batch[start:end], resp: respCh}:
+		}
+		start = end
+	}
 
-	var wg sync.WaitGroup
-	wg.Add(workerCount)
-	for range workerCount {
-		go func() {
-			defer wg.Done()
-			for out := range jobs {
-				grad, err := computeSampleGrad(out.Source[:], out.Target[:], m, tBlock, cW, modelDim)
-				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					continue
-				}
-				results <- grad
+	agg := newWorkerBatchAccum(m, tBlock, cW)
+	for i := 0; i < workerCount; i++ {
+		var part workerBatchAccum
+		select {
+		case <-ctx.Done():
+			return 0, 0, 0, context.Canceled
+		case part = <-respCh:
+		}
+		if part.err != nil {
+			if part.err == context.Canceled {
+				return 0, 0, 0, context.Canceled
 			}
-		}()
+			return 0, 0, 0, part.err
+		}
+		agg.merge(part)
 	}
 
-	for _, out := range batch {
-		jobs <- out
-	}
-	close(jobs)
-
-	wg.Wait()
-	close(results)
-
-	select {
-	case err := <-errCh:
-		return 0, 0, 0, err
-	default:
-	}
-
-	aggCW := matrix.NewZeroMatrix(cW.Rows, cW.Cols)
-	aggW1 := matrix.NewZeroMatrix(tBlock.W1.Rows, tBlock.W1.Cols)
-	aggW2 := matrix.NewZeroMatrix(tBlock.W2.Rows, tBlock.W2.Cols)
-	aggWQ := matrix.NewZeroMatrix(tBlock.WQ.Rows, tBlock.WQ.Cols)
-	aggWK := matrix.NewZeroMatrix(tBlock.WK.Rows, tBlock.WK.Cols)
-	aggWV := matrix.NewZeroMatrix(tBlock.WV.Rows, tBlock.WV.Cols)
-	aggEmbedding := matrix.NewZeroMatrix(m.Vocab, m.Dimensions)
-
-	var batchLoss float64
-	var batchCorrect int64
-	var batchTokens int64
-	count := 0
-
-	for grad := range results {
-		batchLoss += float64(grad.loss)
-		batchCorrect += int64(grad.correct)
-		batchTokens += int64(grad.tokens)
-		count++
-
-		aggCW.AddInPlace(grad.dCW)
-		aggW1.AddInPlace(grad.dW1)
-		aggW2.AddInPlace(grad.dW2)
-		aggWQ.AddInPlace(grad.dWQ)
-		aggWK.AddInPlace(grad.dWK)
-		aggWV.AddInPlace(grad.dWV)
-		aggEmbedding.AddInPlace(grad.dEmbedding)
-	}
-
-	if count == 0 {
+	if agg.count == 0 {
 		return 0, 0, 0, fmt.Errorf("empty gradient batch")
 	}
 
-	scale := learningRate / float32(count)
-	cW.SubScaled(aggCW, scale)
-	tBlock.W2.SubScaled(aggW2, scale)
-	tBlock.W1.SubScaled(aggW1, scale)
-	tBlock.WQ.SubScaled(aggWQ, scale)
-	tBlock.WK.SubScaled(aggWK, scale)
-	tBlock.WV.SubScaled(aggWV, scale)
-	m.SubScaledByGrad(aggEmbedding, scale)
+	scale := learningRate / float32(agg.count)
+	cW.SubScaled(agg.dCW, scale)
+	tBlock.W2.SubScaled(agg.dW2, scale)
+	tBlock.W1.SubScaled(agg.dW1, scale)
+	tBlock.WQ.SubScaled(agg.dWQ, scale)
+	tBlock.WK.SubScaled(agg.dWK, scale)
+	tBlock.WV.SubScaled(agg.dWV, scale)
+	m.SubScaledByGrad(agg.dEmbedding, scale)
 
-	return batchLoss, batchCorrect, batchTokens, nil
+	return agg.loss, agg.correct, agg.tokens, nil
+}
+
+func newWorkerBatchAccum(m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix) workerBatchAccum {
+	return workerBatchAccum{
+		dCW:        matrix.NewZeroMatrix(cW.Rows, cW.Cols),
+		dW1:        matrix.NewZeroMatrix(tBlock.W1.Rows, tBlock.W1.Cols),
+		dW2:        matrix.NewZeroMatrix(tBlock.W2.Rows, tBlock.W2.Cols),
+		dWQ:        matrix.NewZeroMatrix(tBlock.WQ.Rows, tBlock.WQ.Cols),
+		dWK:        matrix.NewZeroMatrix(tBlock.WK.Rows, tBlock.WK.Cols),
+		dWV:        matrix.NewZeroMatrix(tBlock.WV.Rows, tBlock.WV.Cols),
+		dEmbedding: matrix.NewZeroMatrix(m.Vocab, m.Dimensions),
+	}
+}
+
+func (a *workerBatchAccum) add(grad *sampleGrad) {
+	a.loss += float64(grad.loss)
+	a.correct += int64(grad.correct)
+	a.tokens += int64(grad.tokens)
+	a.count++
+
+	a.dCW.AddInPlace(grad.dCW)
+	a.dW1.AddInPlace(grad.dW1)
+	a.dW2.AddInPlace(grad.dW2)
+	a.dWQ.AddInPlace(grad.dWQ)
+	a.dWK.AddInPlace(grad.dWK)
+	a.dWV.AddInPlace(grad.dWV)
+	a.dEmbedding.AddInPlace(grad.dEmbedding)
+}
+
+func (a *workerBatchAccum) merge(other workerBatchAccum) {
+	a.loss += other.loss
+	a.correct += other.correct
+	a.tokens += other.tokens
+	a.count += other.count
+
+	a.dCW.AddInPlace(other.dCW)
+	a.dW1.AddInPlace(other.dW1)
+	a.dW2.AddInPlace(other.dW2)
+	a.dWQ.AddInPlace(other.dWQ)
+	a.dWK.AddInPlace(other.dWK)
+	a.dWV.AddInPlace(other.dWV)
+	a.dEmbedding.AddInPlace(other.dEmbedding)
 }
 
 func computeSampleGrad(source []uint8, target []uint8, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, modelDim int) (*sampleGrad, error) {

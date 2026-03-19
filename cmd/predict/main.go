@@ -4,35 +4,42 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"slices"
-	"strconv"
+	"strings"
 
 	"github.com/juanpablocruz/attention/gen/internal/checkpoint"
 	"github.com/juanpablocruz/attention/gen/internal/embbeding"
 	"github.com/juanpablocruz/attention/gen/internal/matrix"
+	"github.com/juanpablocruz/attention/gen/internal/prompt"
 	"github.com/juanpablocruz/attention/gen/internal/transformer"
 )
 
 func main() {
-	if len(os.Args) != 6 {
-		log.Fatal("usage: predict <n1> <n2> <n3> <n4> <n5>")
+	if len(os.Args) < 2 {
+		log.Fatal("usage: predict \"sort list [3, 4,2,5,1] desc\"")
+	}
+
+	inputPrompt := strings.Join(os.Args[1:], " ")
+	source, err := prompt.Encode(inputPrompt)
+	if err != nil {
+		log.Fatalf("invalid prompt: %v", err)
+	}
+
+	numbers, order, err := prompt.Parse(inputPrompt)
+	if err != nil {
+		log.Fatalf("invalid prompt: %v", err)
+	}
+	targetPrompt := prompt.BuildTarget(numbers, order)
+	targetTokens, err := prompt.Encode(targetPrompt)
+	if err != nil {
+		log.Fatalf("could not encode target prompt: %v", err)
 	}
 
 	const (
-		vocabSize      = 10
+		vocabSize      = prompt.VocabSize
 		modelDim       = 32
-		sequenceLen    = 5
+		sequenceLen    = prompt.SequenceLen
 		checkpointPath = "./checkpoints/embed_model.bin"
 	)
-
-	var source [sequenceLen]uint8
-	for i := 0; i < sequenceLen; i++ {
-		n, err := strconv.Atoi(os.Args[i+1])
-		if err != nil || n < 0 || n >= vocabSize {
-			log.Fatalf("invalid token at position %d: %q (expected 0-%d)", i, os.Args[i+1], vocabSize-1)
-		}
-		source[i] = uint8(n)
-	}
 
 	m := embbeding.New(vocabSize, modelDim)
 	tBlock := transformer.New(modelDim)
@@ -64,11 +71,7 @@ func main() {
 	logits := ffn.Mul(cW)
 	pred := transformer.SelectChoice(logits)
 
-	target := make([]uint8, sequenceLen)
-	copy(target, source[:])
-	slices.Sort(target)
-
-	fmt.Printf("input:    %v\n", source)
-	fmt.Printf("predicted:%v\n", pred)
-	fmt.Printf("target:   %v\n", target)
+	fmt.Printf("prompt:    %s\n", inputPrompt)
+	fmt.Printf("predicted: %v\n", pred[2:7])
+	fmt.Printf("expected:  %v\n", targetTokens[2:7])
 }

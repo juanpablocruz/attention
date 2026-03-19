@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -48,7 +49,7 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(int(workers))
 
-	decode.DecodeOutput(workers, totalRecords, &wg, f, nil)
+	decode.DecodeOutput(context.Background(), workers, totalRecords, &wg, f, nil)
 
 	wg.Wait()
 	fmt.Println("total time:", time.Since(startTime))
