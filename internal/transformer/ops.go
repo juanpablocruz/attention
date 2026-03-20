@@ -122,7 +122,7 @@ func concatHeads(headOuts []*matrix.Matrix) *matrix.Matrix {
 	out := matrix.NewZeroMatrix(rows, totalCols)
 	colOffset := 0
 	for _, h := range headOuts {
-		for i := 0; i < rows; i++ {
+		for i := range rows {
 			copy(out.Vec[i][colOffset:colOffset+h.Cols], h.Vec[i])
 		}
 		colOffset += h.Cols
@@ -137,7 +137,7 @@ func splitHeads(concat *matrix.Matrix, numHeads, headDim int) ([]*matrix.Matrix,
 	}
 
 	out := make([]*matrix.Matrix, numHeads)
-	for h := 0; h < numHeads; h++ {
+	for h := range numHeads {
 		part := matrix.NewZeroMatrix(concat.Rows, headDim)
 		start := h * headDim
 		end := start + headDim

@@ -37,7 +37,7 @@ type modelState struct {
 	CW        matrixState
 }
 
-func Save(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, cW *matrix.Matrix) error {
+func Save(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, cW *matrix.Matrix) (err error) {
 	state := modelState{
 		Version:   2,
 		Embedding: fromEmbedding(e),
@@ -67,13 +67,15 @@ func Save(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, 
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 
 	enc := gob.NewEncoder(f)
 	return enc.Encode(state)
 }
 
-func Load(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, cW *matrix.Matrix) (bool, error) {
+func Load(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, cW *matrix.Matrix) (_ bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -81,7 +83,9 @@ func Load(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, 
 		}
 		return false, err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 
 	dec := gob.NewDecoder(f)
 	var state modelState

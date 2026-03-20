@@ -15,9 +15,9 @@ type Matrix struct {
 func New(rows, cols int) *Matrix {
 	data := make([]float32, rows*cols)
 	vec := make([][]float32, rows)
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		row := data[i*cols : (i+1)*cols]
-		for j := 0; j < cols; j++ {
+		for j := range cols {
 			row[j] = rand.Float32()*0.2 - 0.1
 		}
 		vec[i] = row
@@ -28,7 +28,7 @@ func New(rows, cols int) *Matrix {
 func NewZeroMatrix(rows, cols int) *Matrix {
 	data := make([]float32, rows*cols)
 	vec := make([][]float32, rows)
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		vec[i] = data[i*cols : (i+1)*cols]
 	}
 	return &Matrix{Data: data, Vec: vec, Rows: rows, Cols: cols}
@@ -43,8 +43,7 @@ func Softmax(wm *Matrix) *Matrix {
 		row := wm.Vec[i]
 		maxVal := float64(simdRowMax(row))
 
-		var sumExp float64
-		sumExp = float64(simdRowSumExpShift(row, float32(maxVal)))
+		sumExp := float64(simdRowSumExpShift(row, float32(maxVal)))
 
 		if sumExp == 0 || math.IsInf(sumExp, 0) || math.IsNaN(sumExp) {
 			uniform := float32(1.0 / float64(wm.Cols))

@@ -2,7 +2,9 @@ package trainer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -11,7 +13,7 @@ import (
 
 	"github.com/juanpablocruz/attention/gen/internal/checkpoint"
 	"github.com/juanpablocruz/attention/gen/internal/embbeding"
-	lossfn "github.com/juanpablocruz/attention/gen/internal/loss"
+	"github.com/juanpablocruz/attention/gen/internal/intent"
 	"github.com/juanpablocruz/attention/gen/internal/matrix"
 	"github.com/juanpablocruz/attention/gen/internal/output"
 	"github.com/juanpablocruz/attention/gen/internal/prompt"
@@ -22,6 +24,7 @@ import (
 const (
 	defaultEpochs       = 3
 	defaultCheckpoint   = "./checkpoints/embed_model.bin"
+	defaultIntentPath   = "./checkpoints/intent_model.bin"
 	defaultVocabSize    = prompt.VocabSize
 	defaultModelDim     = 64
 	defaultNumHeads     = 4
@@ -38,6 +41,7 @@ type Config struct {
 	DatasetPath    string
 	Epochs         int
 	CheckpointPath string
+	IntentPath     string
 	VocabSize      int
 	ModelDim       int
 	NumHeads       int
@@ -51,6 +55,13 @@ func (c Config) CheckpointPathOrDefault() string {
 		return c.CheckpointPath
 	}
 	return defaultCheckpoint
+}
+
+func (c Config) IntentPathOrDefault() string {
+	if c.IntentPath != "" {
+		return c.IntentPath
+	}
+	return defaultIntentPath
 }
 
 type EpochMetrics struct {
@@ -159,7 +170,6 @@ func Train(ctx context.Context, cfg Config) (bool, []EpochMetrics, bool, error) 
 		if err := checkpoint.Save(cfg.CheckpointPath, m, tBlock, cW); err != nil {
 			return loaded, nil, interrupted, err
 		}
-
 		metrics = append(metrics, EpochMetrics{
 			Epoch:        epoch,
 			TotalEpochs:  cfg.Epochs,
@@ -181,12 +191,84 @@ func Train(ctx context.Context, cfg Config) (bool, []EpochMetrics, bool, error) 
 	return loaded, metrics, interrupted, nil
 }
 
+type IntentEpochMetrics struct {
+	Epoch       int
+	TotalEpochs int
+	Samples     int64
+	TrainLoss   float64
+	TrainAcc    float64
+	ValLoss     float64
+	ValAcc      float64
+	TrainSeen   int64
+	ValSeen     int64
+	Elapsed     time.Duration
+}
+
+func TrainIntent(ctx context.Context, cfg Config) (bool, []IntentEpochMetrics, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cfg = normalizeConfig(cfg)
+
+	intentModel, err := intent.Load(cfg.IntentPath)
+	loaded := err == nil && intentModel != nil
+	if intentModel == nil {
+		intentModel = intent.NewModel()
+	}
+
+	metrics := make([]IntentEpochMetrics, 0, cfg.Epochs)
+	interrupted := false
+
+	for epoch := 1; epoch <= cfg.Epochs; epoch++ {
+		if ctx.Err() != nil {
+			interrupted = true
+			break
+		}
+
+		start := time.Now()
+		trainLoss, trainAcc, valLoss, valAcc, trainSeen, valSeen, canceled, err := trainIntentEpoch(ctx, epoch, cfg.Epochs, cfg.DatasetPath, intentModel)
+		if err != nil {
+			return loaded, nil, interrupted, err
+		}
+		if canceled {
+			interrupted = true
+		}
+
+		if err := intentModel.Save(cfg.IntentPath); err != nil {
+			return loaded, nil, interrupted, err
+		}
+
+		metrics = append(metrics, IntentEpochMetrics{
+			Epoch:       epoch,
+			TotalEpochs: cfg.Epochs,
+			Samples:     trainSeen + valSeen,
+			TrainLoss:   trainLoss,
+			TrainAcc:    trainAcc,
+			ValLoss:     valLoss,
+			ValAcc:      valAcc,
+			TrainSeen:   trainSeen,
+			ValSeen:     valSeen,
+			Elapsed:     time.Since(start),
+		})
+
+		if canceled {
+			break
+		}
+	}
+
+	return loaded, metrics, interrupted, nil
+}
+
 func normalizeConfig(cfg Config) Config {
 	if cfg.Epochs <= 0 {
 		cfg.Epochs = defaultEpochs
 	}
 	if cfg.CheckpointPath == "" {
 		cfg.CheckpointPath = defaultCheckpoint
+	}
+	if cfg.IntentPath == "" {
+		cfg.IntentPath = defaultIntentPath
 	}
 	if cfg.VocabSize <= 0 {
 		cfg.VocabSize = defaultVocabSize
@@ -233,12 +315,115 @@ func normalizeConfig(cfg Config) Config {
 	return cfg
 }
 
-func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, batchSize, gradWorkers int) (float64, float64, int64, float64, float64, int64, int64, bool, error) {
+func trainIntentEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string, intentModel *intent.Model) (_ float64, _ float64, _ float64, _ float64, trainSeen int64, valSeen int64, _ bool, err error) {
+	f, totalRecords, workers, err := openDataset(datasetPath)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, false, err
+	}
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
+
+	outs := make(chan output.Output, 4096)
+	proc := &outputSink{ctx: ctx, ch: outs}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	decode.DecodeOutput(ctx, int64(workers), totalRecords, &wg, f, proc)
+
+	go func() {
+		wg.Wait()
+		close(outs)
+	}()
+
+	totalLoss := 0.0
+	var correct int64
+	valLoss := 0.0
+	var valCorrect int64
+	var processed int64
+	epochStart := time.Now()
+	lastReport := epochStart
+	spinner := []rune{'|', '/', '-', '\\'}
+	spinnerIdx := 0
+	didReport := false
+	for out := range outs {
+		if ctx.Err() != nil {
+			if didReport {
+				fmt.Print("\n")
+			}
+			return 0, 0, 0, 0, trainSeen, valSeen, true, nil
+		}
+
+		label, err := labelFromRecord(out.Intent)
+		if err != nil {
+			return 0, 0, 0, 0, trainSeen, valSeen, false, err
+		}
+
+		pred, probs := intentModel.Predict(out.Prompt)
+		p := float64(probs[int(label)])
+		if p < 1e-9 {
+			p = 1e-9
+		}
+
+		if isIntentValidationSample(out.Prompt) {
+			if pred == label {
+				valCorrect++
+			}
+			valLoss += -math.Log(p)
+			valSeen++
+		} else {
+			if pred == label {
+				correct++
+			}
+			totalLoss += -math.Log(p)
+			intentModel.TrainStep(out.Prompt, label, 0.01)
+			trainSeen++
+		}
+		processed++
+
+		now := time.Now()
+		if now.Sub(lastReport) >= progressInterval {
+			avgLoss := totalLoss / float64(max(trainSeen, 1))
+			acc := float64(correct) / float64(max(trainSeen, 1))
+			percent := 100.0 * float64(processed) / float64(totalRecords)
+			elapsed := now.Sub(epochStart)
+			rate := float64(processed) / elapsed.Seconds()
+			remaining := float64(totalRecords-processed) / maxFloat(rate, 1e-9)
+			eta := time.Duration(remaining * float64(time.Second))
+
+			fmt.Printf("\r%c epoch=%d/%d progress=%.2f%% samples=%d/%d loss=%.6f acc=%.4f speed=%.0f/s eta=%s", spinner[spinnerIdx], epoch, totalEpochs, percent, processed, totalRecords, avgLoss, acc, rate, eta.Round(time.Second))
+			spinnerIdx = (spinnerIdx + 1) % len(spinner)
+			lastReport = now
+			didReport = true
+		}
+	}
+
+	if didReport {
+		fmt.Print("\n")
+	}
+
+	if trainSeen == 0 {
+		return 0, 0, 0, 0, trainSeen, valSeen, false, fmt.Errorf("dataset has no training records")
+	}
+
+	avgValLoss := 0.0
+	avgValAcc := 0.0
+	if valSeen > 0 {
+		avgValLoss = valLoss / float64(valSeen)
+		avgValAcc = float64(valCorrect) / float64(valSeen)
+	}
+
+	return totalLoss / float64(trainSeen), float64(correct) / float64(trainSeen), avgValLoss, avgValAcc, trainSeen, valSeen, false, nil
+}
+
+func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, learningRate float32, modelDim, batchSize, gradWorkers int) (_ float64, _ float64, _ int64, _ float64, _ float64, _ int64, _ int64, _ bool, err error) {
 	f, totalRecords, workers, err := openDataset(datasetPath)
 	if err != nil {
 		return 0, 0, 0, 0, 0, 0, 0, false, err
 	}
-	defer f.Close()
+	defer func() {
+		err = errors.Join(err, f.Close())
+	}()
 
 	outs := make(chan output.Output, 4096)
 	proc := &outputSink{ctx: ctx, ch: outs}
@@ -286,22 +471,37 @@ func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string,
 							break
 						}
 
-						parsedSource, err := prompt.Parse(out.Prompt)
+						numbers, err := prompt.ExtractNumbers(out.Prompt)
 						if err != nil {
 							accum.err = err
 							break
 						}
-						sourceTokens, err := prompt.DefaultTokenizer.EncodeParsed(parsedSource)
+						label, err := labelFromRecord(out.Intent)
 						if err != nil {
 							accum.err = err
 							break
 						}
-						targetTokens, err := prompt.Encode(out.Target)
+						task, order, err := intent.LabelToTaskOrder(label)
 						if err != nil {
 							accum.err = err
 							break
 						}
-						grad, err := computeSampleGrad(sourceTokens[:], targetTokens[:], parsedSource, m, tBlock, cW, modelDim)
+						sourceTokens, err := prompt.EncodeStructured(task, order, numbers)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						targetNumbers, err := prompt.ExtractNumbers(out.Target)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						targetTokens, err := prompt.EncodeStructured(task, order, targetNumbers)
+						if err != nil {
+							accum.err = err
+							break
+						}
+						grad, err := computeSampleGrad(sourceTokens[:], targetTokens[:], task, len(numbers), m, tBlock, cW, modelDim)
 						if err != nil {
 							accum.err = err
 							break
@@ -342,7 +542,7 @@ func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string,
 
 		batchLoss, batchCorrect, batchTokens, aggSortCorrect, aggSortTokens, aggSumCorrect, aggSumTokens, aggSortSamples, aggSumSamples, err := trainBatch(ctx, batch, m, tBlock, cW, learningRate, modelDim, gradWorkers, workCh)
 		if err != nil {
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				canceled = true
 				break
 			}
@@ -381,7 +581,7 @@ func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string,
 	if len(batch) > 0 {
 		batchLoss, batchCorrect, batchTokens, aggSortCorrect, aggSortTokens, aggSumCorrect, aggSumTokens, aggSortSamples, aggSumSamples, err := trainBatch(ctx, batch, m, tBlock, cW, learningRate, modelDim, gradWorkers, workCh)
 		if err != nil {
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				canceled = true
 			} else {
 				return 0, 0, 0, 0, 0, 0, 0, canceled, err
@@ -435,7 +635,7 @@ func trainBatch(ctx context.Context, batch []output.Output, m *embbeding.Embeddi
 	respCh := make(chan workerBatchAccum, workerCount)
 
 	start := 0
-	for w := 0; w < workerCount; w++ {
+	for w := range workerCount {
 		remainingWorkers := workerCount - w
 		remainingSamples := len(batch) - start
 		chunkSize := (remainingSamples + remainingWorkers - 1) / remainingWorkers
@@ -449,7 +649,7 @@ func trainBatch(ctx context.Context, batch []output.Output, m *embbeding.Embeddi
 	}
 
 	agg := newWorkerBatchAccum(m, tBlock, cW)
-	for i := 0; i < workerCount; i++ {
+	for range workerCount {
 		var part workerBatchAccum
 		select {
 		case <-ctx.Done():
@@ -551,7 +751,7 @@ func (a *workerBatchAccum) merge(other workerBatchAccum) {
 	a.dEmbedding.AddInPlace(other.dEmbedding)
 }
 
-func computeSampleGrad(source []uint8, target []uint8, parsed prompt.ParsedPrompt, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, modelDim int) (*sampleGrad, error) {
+func computeSampleGrad(source []uint8, target []uint8, task string, count int, m *embbeding.Embedding, tBlock *transformer.TransformerBlock, cW *matrix.Matrix, modelDim int) (*sampleGrad, error) {
 	sequenceLen := len(source)
 	sequenceMatrix := matrix.NewZeroMatrix(sequenceLen, modelDim)
 	for j := range sequenceLen {
@@ -570,9 +770,12 @@ func computeSampleGrad(source []uint8, target []uint8, parsed prompt.ParsedPromp
 	logits := ffn.Mul(cW)
 	choices := transformer.SelectChoice(logits)
 
-	correct, measuredTokens := scorePrediction(choices, target, parsed)
+	correct, measuredTokens := scorePrediction(choices, target, task, count)
 
-	lossValue, dLogits := lossfn.CrossEntropyWithGrad(logits, target)
+	lossValue, dLogits, err := taskCrossEntropyWithGrad(logits, target, task, count)
+	if err != nil {
+		return nil, err
+	}
 
 	dFFN := dLogits.Mul(cW.Transpose())
 	dCW := ffn.Transpose().Mul(dLogits)
@@ -601,7 +804,7 @@ func computeSampleGrad(source []uint8, target []uint8, parsed prompt.ParsedPromp
 		loss:        lossValue,
 		correct:     correct,
 		tokens:      measuredTokens,
-		task:        parsed.Task,
+		task:        task,
 		taskCorrect: correct,
 		taskTokens:  measuredTokens,
 		dCW:         dCW,
@@ -613,6 +816,70 @@ func computeSampleGrad(source []uint8, target []uint8, parsed prompt.ParsedPromp
 		dWVHeads:    dWVHeads,
 		dEmbedding:  dEmbedding,
 	}, nil
+}
+
+func taskCrossEntropyWithGrad(logits *matrix.Matrix, target []uint8, task string, count int) (float32, *matrix.Matrix, error) {
+	if logits == nil || logits.Rows == 0 || logits.Cols == 0 {
+		return 0, matrix.NewZeroMatrix(0, 0), nil
+	}
+	if len(target) != logits.Rows {
+		return 0, nil, fmt.Errorf("target length %d must match logits rows %d", len(target), logits.Rows)
+	}
+
+	indices := make([]int, 0, 4)
+	indices = append(indices, 0, 1)
+	if task == prompt.TaskSum {
+		indices = append(indices, 2+prompt.MaxListLen-2, 2+prompt.MaxListLen-1)
+	} else {
+		for i := range count {
+			indices = append(indices, 2+i)
+		}
+		indices = append(indices, prompt.SequenceLen-1)
+	}
+
+	probs := matrix.SoftmaxCopy(logits)
+	grad := matrix.NewZeroMatrix(logits.Rows, logits.Cols)
+
+	var totalLoss float64
+	const eps = 1e-9
+	for _, i := range indices {
+		if i < 0 || i >= logits.Rows {
+			continue
+		}
+		t := int(target[i])
+		if t < 0 || t >= logits.Cols {
+			return 0, nil, fmt.Errorf("target token %d out of range at row %d", t, i)
+		}
+
+		for j := 0; j < logits.Cols; j++ {
+			grad.Vec[i][j] = probs.Vec[i][j]
+		}
+		p := probs.Vec[i][t]
+		if p < eps {
+			p = eps
+		}
+		totalLoss += -math.Log(float64(p))
+		grad.Vec[i][t] -= 1
+	}
+
+	if len(indices) == 0 {
+		return 0, grad, nil
+	}
+
+	scale := float32(1.0 / float64(len(indices)))
+	if task == prompt.TaskSum {
+		scale *= 2.5
+	}
+	for r := 0; r < grad.Rows; r++ {
+		for c := 0; c < grad.Cols; c++ {
+			grad.Vec[r][c] *= scale
+		}
+	}
+	lossScale := float32(1.0 / float64(len(indices)))
+	if task == prompt.TaskSum {
+		lossScale *= 2.5
+	}
+	return float32(totalLoss) * lossScale, grad, nil
 }
 
 func (g *sampleGrad) taskCorrectIfSort() int {
@@ -657,11 +924,11 @@ func (g *sampleGrad) sampleIfSum() int {
 	return 0
 }
 
-func scorePrediction(pred []int, target []uint8, parsed prompt.ParsedPrompt) (int, int) {
+func scorePrediction(pred []int, target []uint8, task string, count int) (int, int) {
 	correct := 0
 	tokens := 0
 
-	if parsed.Task == prompt.TaskSum {
+	if task == prompt.TaskSum {
 		for _, idx := range []int{2 + prompt.MaxListLen - 2, 2 + prompt.MaxListLen - 1} {
 			tokens++
 			if uint8(pred[idx]) == target[idx] {
@@ -671,7 +938,7 @@ func scorePrediction(pred []int, target []uint8, parsed prompt.ParsedPrompt) (in
 		return correct, tokens
 	}
 
-	for i := 0; i < parsed.Count; i++ {
+	for i := range count {
 		idx := 2 + i
 		tokens++
 		if uint8(pred[idx]) == target[idx] {
@@ -706,4 +973,26 @@ func openDataset(path string) (*os.File, int64, int, error) {
 	workers := max(min(runtime.NumCPU(), int(totalRecords)), 1)
 
 	return f, totalRecords, workers, nil
+}
+
+func labelFromRecord(v uint8) (intent.Label, error) {
+	switch v {
+	case output.IntentSortAsc:
+		return intent.SortAsc, nil
+	case output.IntentSortDesc:
+		return intent.SortDesc, nil
+	case output.IntentSum:
+		return intent.Sum, nil
+	default:
+		return intent.SortAsc, fmt.Errorf("invalid intent label: %d", v)
+	}
+}
+
+func isIntentValidationSample(promptText string) bool {
+	var h uint32 = 2166136261
+	for i := 0; i < len(promptText); i++ {
+		h ^= uint32(promptText[i])
+		h *= 16777619
+	}
+	return h%10 == 0
 }

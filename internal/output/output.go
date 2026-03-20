@@ -1,14 +1,19 @@
 package output
 
 const (
-	MaxPromptBytes = 64
+	MaxPromptBytes = 160
 	MaxTargetBytes = 64
-	RecordSize     = 2 + MaxPromptBytes + MaxTargetBytes
+	RecordSize     = 3 + MaxPromptBytes + MaxTargetBytes
+
+	IntentSortAsc  = 0
+	IntentSortDesc = 1
+	IntentSum      = 2
 )
 
 type Output struct {
 	Prompt string
 	Target string
+	Intent uint8
 }
 
 func (o Output) EncodeRecord() [RecordSize]byte {
@@ -27,6 +32,7 @@ func (o Output) EncodeRecord() [RecordSize]byte {
 
 	buf[1+MaxPromptBytes] = byte(len(target))
 	copy(buf[2+MaxPromptBytes:], target)
+	buf[2+MaxPromptBytes+MaxTargetBytes] = o.Intent
 
 	return buf
 }
@@ -38,6 +44,7 @@ func DecodeRecord(buf []byte) Output {
 
 	prompt := string(buf[1 : 1+promptLen])
 	target := string(buf[2+MaxPromptBytes : 2+MaxPromptBytes+targetLen])
+	intent := buf[2+MaxPromptBytes+MaxTargetBytes]
 
-	return Output{Prompt: prompt, Target: target}
+	return Output{Prompt: prompt, Target: target, Intent: intent}
 }

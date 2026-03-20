@@ -33,7 +33,11 @@ func main() {
 		log.Fatal("Could not open file")
 	}
 
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Printf("could not close file %s: %v", arg, err)
+		}
+	}()
 
 	var size = stat.Size()
 
@@ -88,8 +92,22 @@ func printFirstN(f *os.File, n int64) error {
 
 		rec := output.DecodeRecord(buf)
 		fmt.Printf("[%d]\n", i)
+		fmt.Printf("  intent: %s\n", intentName(rec.Intent))
 		fmt.Printf("  prompt: %s\n", rec.Prompt)
 		fmt.Printf("  target: %s\n", rec.Target)
 	}
 	return nil
+}
+
+func intentName(v uint8) string {
+	switch v {
+	case output.IntentSortAsc:
+		return "sort_asc"
+	case output.IntentSortDesc:
+		return "sort_desc"
+	case output.IntentSum:
+		return "sum"
+	default:
+		return "unknown"
+	}
 }

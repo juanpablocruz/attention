@@ -19,7 +19,6 @@ const (
 	MinListLen  = 3
 	MaxListLen  = 7
 	SequenceLen = 2 + MaxListLen + 1
-	ListLen     = MaxListLen
 	VocabSize   = 16
 )
 
@@ -28,16 +27,8 @@ const (
 	TaskSum  = "sum"
 )
 
-var punctuation = regexp.MustCompile(`[\[\],:?]`)
 var numberPattern = regexp.MustCompile(`\d+`)
 var bracketPattern = regexp.MustCompile(`\[(.*?)\]`)
-
-type ParsedPrompt struct {
-	Task    string
-	Numbers [MaxListLen]uint8
-	Count   int
-	Order   string
-}
 
 type Tokenizer struct {
 	vocab map[string]uint8
@@ -110,127 +101,45 @@ func (t *Tokenizer) BuildTarget(task string, numbers []uint8, order string) stri
 	return t.BuildPrompt(TaskSort, sorted, order)
 }
 
-func (t *Tokenizer) Encode(text string) ([SequenceLen]uint8, error) {
-	parsed, err := t.Parse(text)
-	if err != nil {
-		return [SequenceLen]uint8{}, err
+func (t *Tokenizer) EncodeStructured(task, order string, numbers []uint8) ([SequenceLen]uint8, error) {
+	if task != TaskSort && task != TaskSum {
+		return [SequenceLen]uint8{}, fmt.Errorf("invalid task: %s", task)
 	}
-	return t.EncodeParsed(parsed)
-}
+	if task == TaskSort && order != "asc" && order != "desc" {
+		return [SequenceLen]uint8{}, fmt.Errorf("invalid sort order: %s", order)
+	}
+	if len(numbers) < MinListLen || len(numbers) > MaxListLen {
+		return [SequenceLen]uint8{}, fmt.Errorf("expected between %d and %d numbers, got %d", MinListLen, MaxListLen, len(numbers))
+	}
 
-func (t *Tokenizer) EncodeParsed(parsed ParsedPrompt) ([SequenceLen]uint8, error) {
 	var tokens [SequenceLen]uint8
 	for i := range SequenceLen {
 		tokens[i] = t.vocab["pad"]
 	}
 
-	if parsed.Task == TaskSum {
+	if task == TaskSum {
 		tokens[0] = t.vocab[TaskSum]
 		tokens[1] = t.vocab["list"]
-		for i := 0; i < parsed.Count && i < MaxListLen; i++ {
-			tokens[i+2] = parsed.Numbers[i]
+		for i := range numbers {
+			if numbers[i] > 9 {
+				return [SequenceLen]uint8{}, fmt.Errorf("number out of range: %d", numbers[i])
+			}
+			tokens[i+2] = numbers[i]
 		}
 		return tokens, nil
 	}
 
 	tokens[0] = t.vocab[TaskSort]
 	tokens[1] = t.vocab["list"]
-	for i := 0; i < parsed.Count && i < MaxListLen; i++ {
-		tokens[i+2] = parsed.Numbers[i]
+	for i := range numbers {
+		if numbers[i] > 9 {
+			return [SequenceLen]uint8{}, fmt.Errorf("number out of range: %d", numbers[i])
+		}
+		tokens[i+2] = numbers[i]
 	}
-	tokens[SequenceLen-1] = t.vocab[parsed.Order]
+	tokens[SequenceLen-1] = t.vocab[order]
 
 	return tokens, nil
-}
-
-func (t *Tokenizer) Parse(text string) (ParsedPrompt, error) {
-	var parsed ParsedPrompt
-	clean := strings.ToLower(strings.TrimSpace(text))
-	if clean == "" {
-		return parsed, fmt.Errorf("empty prompt")
-	}
-
-	task, err := parseTask(clean)
-	if err != nil {
-		return parsed, err
-	}
-
-	numbers, numCount, err := parseNumbers(clean)
-	if err != nil {
-		return parsed, err
-	}
-
-	parsed.Task = task
-	parsed.Numbers = numbers
-	parsed.Count = numCount
-	if parsed.Count < MinListLen || parsed.Count > MaxListLen {
-		return parsed, fmt.Errorf("expected list length between %d and %d, got %d", MinListLen, MaxListLen, parsed.Count)
-	}
-	if task == TaskSort {
-		order, err := parseOrder(clean)
-		if err != nil {
-			return parsed, err
-		}
-		parsed.Order = order
-	}
-	return parsed, nil
-}
-
-func parseTask(clean string) (string, error) {
-	fields := strings.Fields(punctuation.ReplaceAllString(clean, " "))
-	task := ""
-	for _, f := range fields {
-		switch f {
-		case "sum", "add", "total":
-			if task == TaskSort {
-				return "", fmt.Errorf("prompt contains both sort and sum cues")
-			}
-			task = TaskSum
-		case "sort", "order":
-			if task == TaskSum {
-				return "", fmt.Errorf("prompt contains both sort and sum cues")
-			}
-			task = TaskSort
-		}
-	}
-	if task == "" {
-		return "", fmt.Errorf("could not infer task (sort/order or sum/add)")
-	}
-	return task, nil
-}
-
-func parseOrder(clean string) (string, error) {
-	fields := strings.Fields(punctuation.ReplaceAllString(clean, " "))
-	joined := strings.Join(fields, " ")
-
-	if strings.Contains(joined, "smallest to largest") || strings.Contains(joined, "lowest to highest") {
-		return "asc", nil
-	}
-	if strings.Contains(joined, "largest to smallest") || strings.Contains(joined, "highest to lowest") {
-		return "desc", nil
-	}
-
-	order := ""
-	for _, f := range fields {
-		switch f {
-		case "asc", "ascending", "increasing":
-			if order == "desc" {
-				return "", fmt.Errorf("prompt contains both ascending and descending cues")
-			}
-			order = "asc"
-		case "desc", "descending", "decreasing", "reverse":
-			if order == "asc" {
-				return "", fmt.Errorf("prompt contains both ascending and descending cues")
-			}
-			order = "desc"
-		}
-	}
-
-	if order == "" {
-		return "", fmt.Errorf("could not infer order (use asc/ascending or desc/descending)")
-	}
-
-	return order, nil
 }
 
 func parseNumbers(clean string) ([MaxListLen]uint8, int, error) {
@@ -262,6 +171,17 @@ func parseNumbers(clean string) ([MaxListLen]uint8, int, error) {
 	return numbers, len(matches), nil
 }
 
+func ExtractNumbers(text string) ([]uint8, error) {
+	clean := strings.ToLower(strings.TrimSpace(text))
+	numbers, count, err := parseNumbers(clean)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uint8, count)
+	copy(out, numbers[:count])
+	return out, nil
+}
+
 func BuildPrompt(task string, numbers []uint8, order string) string {
 	return DefaultTokenizer.BuildPrompt(task, numbers, order)
 }
@@ -270,10 +190,6 @@ func BuildTarget(task string, numbers []uint8, order string) string {
 	return DefaultTokenizer.BuildTarget(task, numbers, order)
 }
 
-func Encode(text string) ([SequenceLen]uint8, error) {
-	return DefaultTokenizer.Encode(text)
-}
-
-func Parse(text string) (ParsedPrompt, error) {
-	return DefaultTokenizer.Parse(text)
+func EncodeStructured(task, order string, numbers []uint8) ([SequenceLen]uint8, error) {
+	return DefaultTokenizer.EncodeStructured(task, order, numbers)
 }

@@ -1,7 +1,6 @@
 package embbeding
 
 import (
-	"fmt"
 	"log"
 	"math/rand/v2"
 
@@ -23,30 +22,10 @@ func (v *EmbeddingVec) Add(t []float32) *EmbeddingVec {
 	return v
 }
 
-func (v *EmbeddingVec) AddEmbbeding(t EmbeddingVec) *EmbeddingVec {
-	for i := range len(v.Data) {
-		v.Data[i] = v.Data[i] + t.Data[i]
-	}
-	return v
-}
-
 type Embedding struct {
 	Vec        []EmbeddingVec
 	Vocab      int
 	Dimensions int
-}
-
-func (v *Embedding) Print() {
-	for j := range len(v.Vec) {
-		fmt.Printf("[%d]: [", j)
-		for i := range len(v.Vec[j].Data) {
-			fmt.Printf("%f", v.Vec[j].Data[i])
-			if i < len(v.Vec[j].Data)-1 {
-				fmt.Print(", ")
-			}
-		}
-		fmt.Print("]\n")
-	}
 }
 
 func (e *Embedding) GetVecForEntry(n uint8) *EmbeddingVec {

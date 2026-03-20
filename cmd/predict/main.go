@@ -9,6 +9,7 @@ import (
 
 	"github.com/juanpablocruz/attention/gen/internal/checkpoint"
 	"github.com/juanpablocruz/attention/gen/internal/embbeding"
+	"github.com/juanpablocruz/attention/gen/internal/intent"
 	"github.com/juanpablocruz/attention/gen/internal/matrix"
 	"github.com/juanpablocruz/attention/gen/internal/prompt"
 	"github.com/juanpablocruz/attention/gen/internal/transformer"
@@ -20,19 +21,25 @@ func main() {
 	}
 
 	inputPrompt := strings.Join(os.Args[1:], " ")
-	source, err := prompt.Encode(inputPrompt)
+	numbers, err := prompt.ExtractNumbers(inputPrompt)
 	if err != nil {
 		log.Fatalf("invalid prompt: %v", err)
 	}
 
-	parsedPrompt, err := prompt.Parse(inputPrompt)
+	intentModel, err := intent.Load("./checkpoints/intent_model.bin")
 	if err != nil {
-		log.Fatalf("invalid prompt: %v", err)
+		log.Fatalf("could not load intent model: %v", err)
 	}
-	targetPrompt := prompt.BuildTarget(parsedPrompt.Task, parsedPrompt.Numbers[:parsedPrompt.Count], parsedPrompt.Order)
-	targetTokens, err := prompt.Encode(targetPrompt)
+
+	label, probs := intentModel.Predict(inputPrompt)
+	task, order, err := intent.LabelToTaskOrder(label)
 	if err != nil {
-		log.Fatalf("could not encode target prompt: %v", err)
+		log.Fatalf("could not infer intent: %v", err)
+	}
+
+	source, err := prompt.EncodeStructured(task, order, numbers)
+	if err != nil {
+		log.Fatalf("could not encode prompt: %v", err)
 	}
 
 	const (
@@ -89,16 +96,22 @@ func main() {
 	pred := transformer.SelectChoice(logits)
 
 	fmt.Printf("prompt:    %s\n", inputPrompt)
-	if parsedPrompt.Task == prompt.TaskSum {
+	fmt.Printf("intent:    %s (p=[asc:%.2f desc:%.2f sum:%.2f])\n", taskLabel(task, order), probs[0], probs[1], probs[2])
+	if task == prompt.TaskSum {
 		sumIdxA := 2 + prompt.MaxListLen - 2
 		sumIdxB := 2 + prompt.MaxListLen - 1
-		fmt.Printf("predicted: [%d %d]\n", pred[sumIdxA], pred[sumIdxB])
-		fmt.Printf("expected:  [%d %d]\n", targetTokens[sumIdxA], targetTokens[sumIdxB])
+		fmt.Printf("output:    [%d %d]\n", pred[sumIdxA], pred[sumIdxB])
 		return
 	}
 
 	start := 2
-	end := start + parsedPrompt.Count
-	fmt.Printf("predicted: %v\n", pred[start:end])
-	fmt.Printf("expected:  %v\n", targetTokens[start:end])
+	end := start + len(numbers)
+	fmt.Printf("output:    %v\n", pred[start:end])
+}
+
+func taskLabel(task, order string) string {
+	if task == prompt.TaskSort {
+		return task + "_" + order
+	}
+	return task
 }
