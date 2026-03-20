@@ -27,9 +27,11 @@ type embeddingState struct {
 type modelState struct {
 	Version   int
 	Embedding embeddingState
-	WQ        matrixState
-	WK        matrixState
-	WV        matrixState
+	NumHeads  int
+	WQHeads   []matrixState
+	WKHeads   []matrixState
+	WVHeads   []matrixState
+	WO        matrixState
 	W1        matrixState
 	W2        matrixState
 	CW        matrixState
@@ -37,14 +39,21 @@ type modelState struct {
 
 func Save(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, cW *matrix.Matrix) error {
 	state := modelState{
-		Version:   1,
+		Version:   2,
 		Embedding: fromEmbedding(e),
-		WQ:        fromMatrix(t.WQ),
-		WK:        fromMatrix(t.WK),
-		WV:        fromMatrix(t.WV),
+		NumHeads:  t.NumHeads,
+		WQHeads:   make([]matrixState, t.NumHeads),
+		WKHeads:   make([]matrixState, t.NumHeads),
+		WVHeads:   make([]matrixState, t.NumHeads),
+		WO:        fromMatrix(t.WO),
 		W1:        fromMatrix(t.W1),
 		W2:        fromMatrix(t.W2),
 		CW:        fromMatrix(cW),
+	}
+	for h := 0; h < t.NumHeads; h++ {
+		state.WQHeads[h] = fromMatrix(t.WQ[h])
+		state.WKHeads[h] = fromMatrix(t.WK[h])
+		state.WVHeads[h] = fromMatrix(t.WV[h])
 	}
 
 	dir := filepath.Dir(path)
@@ -80,20 +89,28 @@ func Load(path string, e *embbeding.Embedding, t *transformer.TransformerBlock, 
 		return false, err
 	}
 
-	if state.Version != 1 {
+	if state.Version != 2 {
 		return false, fmt.Errorf("unsupported checkpoint version: %d", state.Version)
 	}
 
 	if err := toEmbedding(state.Embedding, e); err != nil {
 		return false, err
 	}
-	if err := toMatrix(state.WQ, t.WQ); err != nil {
-		return false, err
+	if state.NumHeads != t.NumHeads || len(state.WQHeads) != t.NumHeads || len(state.WKHeads) != t.NumHeads || len(state.WVHeads) != t.NumHeads {
+		return false, fmt.Errorf("head mismatch: checkpoint=%d current=%d", state.NumHeads, t.NumHeads)
 	}
-	if err := toMatrix(state.WK, t.WK); err != nil {
-		return false, err
+	for h := 0; h < t.NumHeads; h++ {
+		if err := toMatrix(state.WQHeads[h], t.WQ[h]); err != nil {
+			return false, err
+		}
+		if err := toMatrix(state.WKHeads[h], t.WK[h]); err != nil {
+			return false, err
+		}
+		if err := toMatrix(state.WVHeads[h], t.WV[h]); err != nil {
+			return false, err
+		}
 	}
-	if err := toMatrix(state.WV, t.WV); err != nil {
+	if err := toMatrix(state.WO, t.WO); err != nil {
 		return false, err
 	}
 	if err := toMatrix(state.W1, t.W1); err != nil {

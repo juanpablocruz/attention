@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/juanpablocruz/attention/gen/internal/checkpoint"
@@ -24,25 +25,42 @@ func main() {
 		log.Fatalf("invalid prompt: %v", err)
 	}
 
-	numbers, order, err := prompt.Parse(inputPrompt)
+	parsedPrompt, err := prompt.Parse(inputPrompt)
 	if err != nil {
 		log.Fatalf("invalid prompt: %v", err)
 	}
-	targetPrompt := prompt.BuildTarget(numbers, order)
+	targetPrompt := prompt.BuildTarget(parsedPrompt.Task, parsedPrompt.Numbers[:parsedPrompt.Count], parsedPrompt.Order)
 	targetTokens, err := prompt.Encode(targetPrompt)
 	if err != nil {
 		log.Fatalf("could not encode target prompt: %v", err)
 	}
 
 	const (
-		vocabSize      = prompt.VocabSize
-		modelDim       = 32
-		sequenceLen    = prompt.SequenceLen
-		checkpointPath = "./checkpoints/embed_model.bin"
+		vocabSize       = prompt.VocabSize
+		defaultModelDim = 64
+		defaultHeads    = 4
+		sequenceLen     = prompt.SequenceLen
+		checkpointPath  = "./checkpoints/embed_model.bin"
 	)
 
+	modelDim := defaultModelDim
+	if v := os.Getenv("ATTN_MODEL_DIM"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err == nil && parsed > 0 {
+			modelDim = parsed
+		}
+	}
+
+	numHeads := defaultHeads
+	if v := os.Getenv("ATTN_NUM_HEADS"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err == nil && parsed > 0 {
+			numHeads = parsed
+		}
+	}
+
 	m := embbeding.New(vocabSize, modelDim)
-	tBlock := transformer.New(modelDim)
+	tBlock := transformer.New(modelDim, numHeads)
 	cW := matrix.New(modelDim, vocabSize)
 
 	loaded, err := checkpoint.Load(checkpointPath, m, tBlock, cW)
@@ -54,17 +72,16 @@ func main() {
 	}
 
 	sequenceMatrix := matrix.NewZeroMatrix(sequenceLen, modelDim)
-	for j := 0; j < sequenceLen; j++ {
+	for j := range sequenceLen {
 		vec := m.GetVecForEntry(source[j])
 		positioned := transformer.AddPosition(j, vec)
 		copy(sequenceMatrix.Vec[j], positioned.Data)
 	}
 
-	q := sequenceMatrix.Mul(tBlock.WQ)
-	k := sequenceMatrix.Mul(tBlock.WK)
-	v := sequenceMatrix.Mul(tBlock.WV)
-
-	attention := transformer.ScaledAttention(q, k, v)
+	attention, _, err := transformer.MultiHeadAttention(sequenceMatrix, tBlock)
+	if err != nil {
+		log.Fatalf("attention forward failed: %v", err)
+	}
 	out := transformer.AddAndNorm(sequenceMatrix, attention)
 	ffn, _ := transformer.ExpandWithCache(out, tBlock.W1, tBlock.W2)
 
@@ -72,6 +89,16 @@ func main() {
 	pred := transformer.SelectChoice(logits)
 
 	fmt.Printf("prompt:    %s\n", inputPrompt)
-	fmt.Printf("predicted: %v\n", pred[2:7])
-	fmt.Printf("expected:  %v\n", targetTokens[2:7])
+	if parsedPrompt.Task == prompt.TaskSum {
+		sumIdxA := 2 + prompt.MaxListLen - 2
+		sumIdxB := 2 + prompt.MaxListLen - 1
+		fmt.Printf("predicted: [%d %d]\n", pred[sumIdxA], pred[sumIdxB])
+		fmt.Printf("expected:  [%d %d]\n", targetTokens[sumIdxA], targetTokens[sumIdxB])
+		return
+	}
+
+	start := 2
+	end := start + parsedPrompt.Count
+	fmt.Printf("predicted: %v\n", pred[start:end])
+	fmt.Printf("expected:  %v\n", targetTokens[start:end])
 }

@@ -32,15 +32,9 @@ func (o Output) EncodeRecord() [RecordSize]byte {
 }
 
 func DecodeRecord(buf []byte) Output {
-	promptLen := int(buf[0])
-	if promptLen > MaxPromptBytes {
-		promptLen = MaxPromptBytes
-	}
+	promptLen := min(int(buf[0]), MaxPromptBytes)
 
-	targetLen := int(buf[1+MaxPromptBytes])
-	if targetLen > MaxTargetBytes {
-		targetLen = MaxTargetBytes
-	}
+	targetLen := min(int(buf[1+MaxPromptBytes]), MaxTargetBytes)
 
 	prompt := string(buf[1 : 1+promptLen])
 	target := string(buf[2+MaxPromptBytes : 2+MaxPromptBytes+targetLen])

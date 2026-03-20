@@ -35,7 +35,7 @@ func main() {
 	}
 
 	for _, m := range epochMetrics {
-		fmt.Printf("epoch=%d/%d train_samples=%d train_loss=%.6f train_token_acc=%.4f elapsed=%s\n", m.Epoch, m.TotalEpochs, m.Samples, m.Loss, m.TokenAcc, m.Elapsed)
+		fmt.Printf("epoch=%d/%d train_samples=%d train_loss=%.6f train_token_acc=%.4f sort_token_acc=%.4f sort_samples=%d sum_token_acc=%.4f sum_samples=%d elapsed=%s\n", m.Epoch, m.TotalEpochs, m.Samples, m.Loss, m.TokenAcc, m.SortTokenAcc, m.SortSamples, m.SumTokenAcc, m.SumSamples, m.Elapsed)
 	}
 
 	if interrupted {

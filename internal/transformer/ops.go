@@ -1,11 +1,22 @@
 package transformer
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/juanpablocruz/attention/gen/internal/embbeding"
 	"github.com/juanpablocruz/attention/gen/internal/matrix"
 )
+
+type HeadCache struct {
+	Q, K, V *matrix.Matrix
+}
+
+type MHACache struct {
+	Input  *matrix.Matrix
+	Concat *matrix.Matrix
+	Heads  []HeadCache
+}
 
 func AddPosition(pos int, vec *embbeding.EmbeddingVec) *embbeding.EmbeddingVec {
 	modelDim := len(vec.Data)
@@ -38,6 +49,105 @@ func ScaledAttention(q *matrix.Matrix, k *matrix.Matrix, v *matrix.Matrix) *matr
 
 	s := matrix.Softmax(f)
 	return s.Mul(v)
+}
+
+func MultiHeadAttention(x *matrix.Matrix, block *TransformerBlock) (*matrix.Matrix, *MHACache, error) {
+	if x == nil || block == nil {
+		return nil, nil, fmt.Errorf("nil input for multi-head attention")
+	}
+	if len(block.WQ) != block.NumHeads || len(block.WK) != block.NumHeads || len(block.WV) != block.NumHeads {
+		return nil, nil, fmt.Errorf("inconsistent number of attention heads")
+	}
+
+	headOuts := make([]*matrix.Matrix, block.NumHeads)
+	headCaches := make([]HeadCache, block.NumHeads)
+	for h := 0; h < block.NumHeads; h++ {
+		q := x.Mul(block.WQ[h])
+		k := x.Mul(block.WK[h])
+		v := x.Mul(block.WV[h])
+
+		headOuts[h] = ScaledAttention(q, k, v)
+		headCaches[h] = HeadCache{Q: q, K: k, V: v}
+	}
+
+	concat := concatHeads(headOuts)
+	out := concat.Mul(block.WO)
+
+	return out, &MHACache{Input: x, Concat: concat, Heads: headCaches}, nil
+}
+
+func MultiHeadAttentionBackward(dOut *matrix.Matrix, cache *MHACache, block *TransformerBlock) (dWQ, dWK, dWV []*matrix.Matrix, dWO, dInput *matrix.Matrix, err error) {
+	if dOut == nil || cache == nil || block == nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("nil inputs for multi-head backward")
+	}
+
+	dWO = cache.Concat.Transpose().Mul(dOut)
+	dConcat := dOut.Mul(block.WO.Transpose())
+	dHeadOuts, splitErr := splitHeads(dConcat, block.NumHeads, block.HeadDim)
+	if splitErr != nil {
+		return nil, nil, nil, nil, nil, splitErr
+	}
+
+	dWQ = make([]*matrix.Matrix, block.NumHeads)
+	dWK = make([]*matrix.Matrix, block.NumHeads)
+	dWV = make([]*matrix.Matrix, block.NumHeads)
+	dInput = matrix.NewZeroMatrix(cache.Input.Rows, cache.Input.Cols)
+
+	for h := 0; h < block.NumHeads; h++ {
+		dQ, dK, dV := ScaledAttentionBackward(dHeadOuts[h], cache.Heads[h].Q, cache.Heads[h].K, cache.Heads[h].V)
+
+		dWQ[h] = cache.Input.Transpose().Mul(dQ)
+		dWK[h] = cache.Input.Transpose().Mul(dK)
+		dWV[h] = cache.Input.Transpose().Mul(dV)
+
+		dXQ := dQ.Mul(block.WQ[h].Transpose())
+		dXK := dK.Mul(block.WK[h].Transpose())
+		dXV := dV.Mul(block.WV[h].Transpose())
+
+		dInput.AddInPlace(dXQ)
+		dInput.AddInPlace(dXK)
+		dInput.AddInPlace(dXV)
+	}
+
+	return dWQ, dWK, dWV, dWO, dInput, nil
+}
+
+func concatHeads(headOuts []*matrix.Matrix) *matrix.Matrix {
+	rows := headOuts[0].Rows
+	totalCols := 0
+	for _, h := range headOuts {
+		totalCols += h.Cols
+	}
+
+	out := matrix.NewZeroMatrix(rows, totalCols)
+	colOffset := 0
+	for _, h := range headOuts {
+		for i := 0; i < rows; i++ {
+			copy(out.Vec[i][colOffset:colOffset+h.Cols], h.Vec[i])
+		}
+		colOffset += h.Cols
+	}
+
+	return out
+}
+
+func splitHeads(concat *matrix.Matrix, numHeads, headDim int) ([]*matrix.Matrix, error) {
+	if concat.Cols != numHeads*headDim {
+		return nil, fmt.Errorf("invalid concat shape for head split: got %d cols, expected %d", concat.Cols, numHeads*headDim)
+	}
+
+	out := make([]*matrix.Matrix, numHeads)
+	for h := 0; h < numHeads; h++ {
+		part := matrix.NewZeroMatrix(concat.Rows, headDim)
+		start := h * headDim
+		end := start + headDim
+		for i := 0; i < concat.Rows; i++ {
+			copy(part.Vec[i], concat.Vec[i][start:end])
+		}
+		out[h] = part
+	}
+
+	return out, nil
 }
 
 func ScaledAttentionBackward(dOut, q, k, v *matrix.Matrix) (dQ, dK, dV *matrix.Matrix) {
@@ -105,11 +215,7 @@ func layerNorm(residual *matrix.Matrix) *matrix.Matrix {
 func mean(m *matrix.Matrix) []float32 {
 	result := make([]float32, m.Rows)
 	for i := range m.Rows {
-		sum := float32(0.0)
-		for j := range m.Cols {
-			sum += m.Vec[i][j]
-		}
-		result[i] = sum / float32(m.Cols)
+		result[i] = matrix.RowMean(m.Vec[i])
 	}
 	return result
 }
@@ -117,24 +223,18 @@ func mean(m *matrix.Matrix) []float32 {
 func variance(m *matrix.Matrix, means []float32) []float32 {
 	result := make([]float32, m.Rows)
 	for i := range m.Rows {
-		sum := float32(0.0)
-		for j := range m.Cols {
-			sum += float32(math.Pow(float64(m.Vec[i][j]-means[i]), 2))
-		}
-		result[i] = sum / float32(m.Cols)
+		result[i] = matrix.RowVariance(m.Vec[i], means[i])
 	}
 
 	return result
 }
 
 func normalize(m *matrix.Matrix, means []float32, variances []float32) *matrix.Matrix {
-	result := matrix.New(m.Rows, m.Cols)
+	result := matrix.NewZeroMatrix(m.Rows, m.Cols)
 	const epsilon float32 = 1e-5
 	for i := range m.Rows {
 		stdDev := float32(math.Sqrt(float64(variances[i] + epsilon)))
-		for j := range m.Cols {
-			result.Vec[i][j] = (m.Vec[i][j] - means[i]) / stdDev
-		}
+		matrix.NormalizeRow(result.Vec[i], m.Vec[i], means[i], 1/stdDev)
 	}
 
 	return result

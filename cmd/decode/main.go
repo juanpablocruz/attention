@@ -3,19 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/juanpablocruz/attention/gen/internal/output"
 	"github.com/juanpablocruz/attention/gen/pkg/decode"
 )
 
 func main() {
 
 	if len(os.Args) < 2 {
-		panic("Invalid usage: gen [len of dataset]")
+		log.Fatal("usage: decode <dataset.bin> [first_n]")
 	}
 
 	arg := os.Args[1]
@@ -43,6 +46,21 @@ func main() {
 		return
 	}
 
+	if len(os.Args) >= 3 {
+		n, err := strconv.ParseInt(os.Args[2], 10, 64)
+		if err != nil || n <= 0 {
+			log.Fatal("invalid first_n value")
+		}
+		if n > totalRecords {
+			n = totalRecords
+		}
+
+		if err := printFirstN(f, n); err != nil {
+			log.Fatalf("could not print first %d records: %v", n, err)
+		}
+		return
+	}
+
 	workers := min(int64(runtime.NumCPU()), totalRecords)
 
 	startTime := time.Now()
@@ -54,4 +72,24 @@ func main() {
 	wg.Wait()
 	fmt.Println("total time:", time.Since(startTime))
 	fmt.Printf("decoded %d records with %d workers\n", totalRecords, workers)
+}
+
+func printFirstN(f *os.File, n int64) error {
+	buf := make([]byte, decode.RecordSize)
+	for i := range n {
+		offset := i * decode.RecordSize
+		_, err := f.ReadAt(buf, offset)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		rec := output.DecodeRecord(buf)
+		fmt.Printf("[%d]\n", i)
+		fmt.Printf("  prompt: %s\n", rec.Prompt)
+		fmt.Printf("  target: %s\n", rec.Target)
+	}
+	return nil
 }

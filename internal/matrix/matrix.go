@@ -6,31 +6,32 @@ import (
 )
 
 type Matrix struct {
+	Data []float32
 	Vec  [][]float32
 	Cols int
 	Rows int
 }
 
 func New(rows, cols int) *Matrix {
+	data := make([]float32, rows*cols)
 	vec := make([][]float32, rows)
-	for i := range vec {
-		vec[i] = make([]float32, cols)
-		for j := range vec[i] {
-			vec[i][j] = rand.Float32()*0.2 - 0.1
+	for i := 0; i < rows; i++ {
+		row := data[i*cols : (i+1)*cols]
+		for j := 0; j < cols; j++ {
+			row[j] = rand.Float32()*0.2 - 0.1
 		}
+		vec[i] = row
 	}
-	return &Matrix{Vec: vec, Rows: rows, Cols: cols}
+	return &Matrix{Data: data, Vec: vec, Rows: rows, Cols: cols}
 }
 
 func NewZeroMatrix(rows, cols int) *Matrix {
+	data := make([]float32, rows*cols)
 	vec := make([][]float32, rows)
-	for i := range vec {
-		vec[i] = make([]float32, cols)
-		for j := range vec[i] {
-			vec[i][j] = 0
-		}
+	for i := 0; i < rows; i++ {
+		vec[i] = data[i*cols : (i+1)*cols]
 	}
-	return &Matrix{Vec: vec, Rows: rows, Cols: cols}
+	return &Matrix{Data: data, Vec: vec, Rows: rows, Cols: cols}
 }
 
 func Softmax(wm *Matrix) *Matrix {
@@ -39,17 +40,11 @@ func Softmax(wm *Matrix) *Matrix {
 	}
 
 	for i := range wm.Rows {
-		maxVal := float64(wm.Vec[i][0])
-		for j := 1; j < wm.Cols; j++ {
-			if float64(wm.Vec[i][j]) > maxVal {
-				maxVal = float64(wm.Vec[i][j])
-			}
-		}
+		row := wm.Vec[i]
+		maxVal := float64(simdRowMax(row))
 
 		var sumExp float64
-		for j := range wm.Cols {
-			sumExp += math.Exp(float64(wm.Vec[i][j]) - maxVal)
-		}
+		sumExp = float64(simdRowSumExpShift(row, float32(maxVal)))
 
 		if sumExp == 0 || math.IsInf(sumExp, 0) || math.IsNaN(sumExp) {
 			uniform := float32(1.0 / float64(wm.Cols))
@@ -81,14 +76,9 @@ func SoftmaxCopy(wm *Matrix) *Matrix {
 }
 
 func (wm *Matrix) Transpose() *Matrix {
-	n := &Matrix{
-		Rows: wm.Cols,
-		Cols: wm.Rows,
-		Vec:  make([][]float32, wm.Cols),
-	}
+	n := NewZeroMatrix(wm.Cols, wm.Rows)
 
 	for i := 0; i < n.Rows; i++ {
-		n.Vec[i] = make([]float32, n.Cols)
 		for j := 0; j < n.Cols; j++ {
 			n.Vec[i][j] = wm.Vec[j][i]
 		}
@@ -114,18 +104,13 @@ func (wm *Matrix) Dot(t *Matrix) []float32 {
 }
 
 func (wm *Matrix) Mul(other *Matrix) *Matrix {
-	result := New(wm.Rows, other.Cols)
-
-	for i := 0; i < wm.Rows; i++ {
-		for j := 0; j < other.Cols; j++ {
-			var sum float32
-			for k := 0; k < wm.Cols; k++ { // shared dimension
-				sum += wm.Vec[i][k] * other.Vec[k][j]
-			}
-			result.Vec[i][j] = sum
-		}
+	if wm == nil || other == nil {
+		return nil
 	}
-	return result
+	if wm.Cols != other.Rows {
+		return nil
+	}
+	return mulNeon(wm, other)
 }
 
 func (wm *Matrix) Add(other *Matrix) *Matrix {
@@ -133,7 +118,7 @@ func (wm *Matrix) Add(other *Matrix) *Matrix {
 		return nil
 	}
 
-	result := New(wm.Rows, other.Cols)
+	result := NewZeroMatrix(wm.Rows, other.Cols)
 
 	for i := 0; i < wm.Rows; i++ {
 		for j := 0; j < wm.Cols; j++ {
@@ -144,7 +129,7 @@ func (wm *Matrix) Add(other *Matrix) *Matrix {
 }
 
 func (wm *Matrix) Div(n float32) *Matrix {
-	result := New(wm.Rows, wm.Cols)
+	result := NewZeroMatrix(wm.Rows, wm.Cols)
 
 	for i := range wm.Rows {
 		for j := range wm.Cols {
@@ -155,13 +140,10 @@ func (wm *Matrix) Div(n float32) *Matrix {
 }
 
 func (wm *Matrix) ReLu() {
-	for i := range wm.Rows {
-		for j := range wm.Cols {
-			if wm.Vec[i][j] < 0 {
-				wm.Vec[i][j] = 0
-			}
-		}
+	if wm == nil || len(wm.Data) == 0 {
+		return
 	}
+	simdReLU(wm.Data)
 }
 
 func (wm *Matrix) SubScaled(grad *Matrix, scale float32) {
@@ -171,11 +153,12 @@ func (wm *Matrix) SubScaled(grad *Matrix, scale float32) {
 	if wm.Rows != grad.Rows || wm.Cols != grad.Cols {
 		return
 	}
-
+	if len(wm.Data) == wm.Rows*wm.Cols && len(grad.Data) == grad.Rows*grad.Cols {
+		simdSubScaled(wm.Data, grad.Data, scale)
+		return
+	}
 	for i := 0; i < wm.Rows; i++ {
-		for j := 0; j < wm.Cols; j++ {
-			wm.Vec[i][j] -= scale * grad.Vec[i][j]
-		}
+		simdSubScaled(wm.Vec[i], grad.Vec[i], scale)
 	}
 }
 
@@ -186,10 +169,23 @@ func (wm *Matrix) AddInPlace(other *Matrix) {
 	if wm.Rows != other.Rows || wm.Cols != other.Cols {
 		return
 	}
-
-	for i := 0; i < wm.Rows; i++ {
-		for j := 0; j < wm.Cols; j++ {
-			wm.Vec[i][j] += other.Vec[i][j]
-		}
+	if len(wm.Data) == wm.Rows*wm.Cols && len(other.Data) == other.Rows*other.Cols {
+		simdAddInPlace(wm.Data, other.Data)
+		return
 	}
+	for i := 0; i < wm.Rows; i++ {
+		simdAddInPlace(wm.Vec[i], other.Vec[i])
+	}
+}
+
+func RowMean(row []float32) float32 {
+	return simdRowMean(row)
+}
+
+func RowVariance(row []float32, mean float32) float32 {
+	return simdRowVariance(row, mean)
+}
+
+func NormalizeRow(dst, src []float32, mean, invStd float32) {
+	simdNormalizeRow(dst, src, mean, invStd)
 }

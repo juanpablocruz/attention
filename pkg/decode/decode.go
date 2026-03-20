@@ -56,6 +56,11 @@ func DecodeOutput(ctx context.Context, workers, totalRecords int64, wg *sync.Wai
 					log.Fatalf("worker %d read error at offset %d: %v", workerID, offset, err)
 				}
 
+				if process == nil {
+					current += nrecs
+					continue
+				}
+
 				for i := range nrecs {
 					select {
 					case <-ctx.Done():
@@ -66,9 +71,7 @@ func DecodeOutput(ctx context.Context, workers, totalRecords int64, wg *sync.Wai
 					start := i * RecordSize
 					end := start + RecordSize
 					out := output.DecodeRecord(chunk[start:end])
-					if process != nil {
-						process.Process(out)
-					}
+					process.Process(out)
 				}
 
 				current += nrecs
