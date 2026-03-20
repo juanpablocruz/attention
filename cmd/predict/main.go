@@ -7,12 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/juanpablocruz/attention/gen/internal/checkpoint"
-	"github.com/juanpablocruz/attention/gen/internal/embbeding"
+	"github.com/juanpablocruz/attention/gen/internal/attention"
 	"github.com/juanpablocruz/attention/gen/internal/intent"
-	"github.com/juanpablocruz/attention/gen/internal/matrix"
 	"github.com/juanpablocruz/attention/gen/internal/prompt"
-	"github.com/juanpablocruz/attention/gen/internal/transformer"
 )
 
 func main() {
@@ -46,7 +43,6 @@ func main() {
 		vocabSize       = prompt.VocabSize
 		defaultModelDim = 64
 		defaultHeads    = 4
-		sequenceLen     = prompt.SequenceLen
 		checkpointPath  = "./checkpoints/embed_model.bin"
 	)
 
@@ -66,11 +62,9 @@ func main() {
 		}
 	}
 
-	m := embbeding.New(vocabSize, modelDim)
-	tBlock := transformer.New(modelDim, numHeads)
-	cW := matrix.New(modelDim, vocabSize)
+	model := attention.NewModel(vocabSize, modelDim, numHeads)
 
-	loaded, err := checkpoint.Load(checkpointPath, m, tBlock, cW)
+	loaded, err := model.LoadCheckpoint(checkpointPath)
 	if err != nil {
 		log.Fatalf("could not load checkpoint: %v", err)
 	}
@@ -78,22 +72,11 @@ func main() {
 		log.Fatalf("checkpoint not found at %s", checkpointPath)
 	}
 
-	sequenceMatrix := matrix.NewZeroMatrix(sequenceLen, modelDim)
-	for j := range sequenceLen {
-		vec := m.GetVecForEntry(source[j])
-		positioned := transformer.AddPosition(j, vec)
-		copy(sequenceMatrix.Vec[j], positioned.Data)
-	}
-
-	attention, _, err := transformer.MultiHeadAttention(sequenceMatrix, tBlock)
+	pass, err := model.Forward(source[:])
 	if err != nil {
-		log.Fatalf("attention forward failed: %v", err)
+		log.Fatalf("generator forward failed: %v", err)
 	}
-	out := transformer.AddAndNorm(sequenceMatrix, attention)
-	ffn, _ := transformer.ExpandWithCache(out, tBlock.W1, tBlock.W2)
-
-	logits := ffn.Mul(cW)
-	pred := transformer.SelectChoice(logits)
+	pred := pass.Choices
 
 	fmt.Printf("prompt:    %s\n", inputPrompt)
 	fmt.Printf("intent:    %s (p=[asc:%.2f desc:%.2f sum:%.2f])\n", taskLabel(task, order), probs[0], probs[1], probs[2])

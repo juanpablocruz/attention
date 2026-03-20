@@ -34,6 +34,7 @@ type Model struct {
 	B2 []float32
 }
 
+// tokenRe extracts lowercase alphabetic words and digit runs as the basic intent tokens.
 var tokenRe = regexp.MustCompile(`[a-z]+|\d+`)
 
 func NewModel() *Model {
@@ -147,12 +148,12 @@ func Load(path string) (_ *Model, err error) {
 	if len(m.W1) != HiddenDim || len(m.B1) != HiddenDim || len(m.W2) != int(NumLabels) || len(m.B2) != int(NumLabels) {
 		return nil, fmt.Errorf("invalid intent model shape")
 	}
-	for h := 0; h < HiddenDim; h++ {
+	for h := range HiddenDim {
 		if len(m.W1[h]) != FeatureDim {
 			return nil, fmt.Errorf("invalid intent model shape")
 		}
 	}
-	for c := 0; c < int(NumLabels); c++ {
+	for c := range int(NumLabels) {
 		if len(m.W2[c]) != HiddenDim {
 			return nil, fmt.Errorf("invalid intent model shape")
 		}
@@ -163,9 +164,11 @@ func Load(path string) (_ *Model, err error) {
 func featurize(text string) map[int]float32 {
 	toks := tokenize(text)
 	feats := make(map[int]float32, len(toks)*8)
-	for i := 0; i < len(toks); i++ {
+	for i := range toks {
+		// Hash each word unigram into the fixed-size feature space.
 		feats[hashFeature("w:"+toks[i])] += 1
 		if i+1 < len(toks) {
+			// Hash adjacent word bigrams into the same feature space.
 			feats[hashFeature("b:"+toks[i]+"_"+toks[i+1])] += 1
 		}
 	}
@@ -202,6 +205,7 @@ func normalizeForCharNGrams(text string) string {
 
 func tokenize(text string) []string {
 	t := strings.ToLower(text)
+	// Tokenization is regex-based.
 	return tokenRe.FindAllString(t, -1)
 }
 
@@ -214,21 +218,22 @@ func hashFeature(s string) int {
 func (m *Model) forward(x map[int]float32) ([]float32, []float32, []float32) {
 	hiddenPre := make([]float32, HiddenDim)
 	hiddenAct := make([]float32, HiddenDim)
-	for h := 0; h < HiddenDim; h++ {
+	for h := range HiddenDim {
 		s := m.B1[h]
 		for idx, v := range x {
 			s += m.W1[h][idx] * v
 		}
 		hiddenPre[h] = s
+		// ReLU activation.
 		if s > 0 {
 			hiddenAct[h] = s
 		}
 	}
 
 	logits := make([]float32, NumLabels)
-	for c := 0; c < int(NumLabels); c++ {
+	for c := range int(NumLabels) {
 		s := m.B2[c]
-		for h := 0; h < HiddenDim; h++ {
+		for h := range HiddenDim {
 			s += m.W2[c][h] * hiddenAct[h]
 		}
 		logits[c] = s

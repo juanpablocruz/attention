@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/fatih/color"
+	"github.com/juanpablocruz/attention/gen/internal/progress"
 	"github.com/juanpablocruz/attention/gen/internal/trainer"
 )
 
@@ -16,7 +19,13 @@ func main() {
 		log.Fatal("usage: intent <train_dataset.bin>")
 	}
 
-	cfg := trainer.Config{DatasetPath: os.Args[1]}
+	cfg := trainer.Config{
+		DatasetPath: os.Args[1],
+		Progress: func(epoch, totalEpochs int, total int64, start time.Time) trainer.ProgressReporter {
+			return progress.NewReporter(epoch, totalEpochs, total, start, formatIntentProgress)
+		},
+		ProgressInterval: 200 * time.Millisecond,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -38,5 +47,26 @@ func main() {
 
 	if interrupted {
 		log.Printf("intent training interrupted, latest checkpoint saved")
+	}
+}
+
+func formatIntentProgress(update trainer.ProgressUpdate) string {
+	return fmt.Sprintf(
+		"loss=%.6f acc=%s speed=%.0f/s eta=%s",
+		update.Loss,
+		colorizeAccuracy(update.Accuracy),
+		update.Speed,
+		update.ETA,
+	)
+}
+
+func colorizeAccuracy(acc float64) string {
+	switch {
+	case acc < 0.4:
+		return color.New(color.FgRed).Sprintf("%.4f", acc)
+	case acc < 0.8:
+		return color.New(color.FgYellow).Sprintf("%.4f", acc)
+	default:
+		return color.New(color.FgGreen).Sprintf("%.4f", acc)
 	}
 }

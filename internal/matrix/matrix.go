@@ -34,6 +34,25 @@ func NewZeroMatrix(rows, cols int) *Matrix {
 	return &Matrix{Data: data, Vec: vec, Rows: rows, Cols: cols}
 }
 
+func ensureMatrix(dst *Matrix, rows, cols int) *Matrix {
+	size := rows * cols
+	if dst == nil {
+		dst = &Matrix{}
+	}
+	if len(dst.Data) != size {
+		dst.Data = make([]float32, size)
+	}
+	if len(dst.Vec) != rows {
+		dst.Vec = make([][]float32, rows)
+	}
+	for i := range rows {
+		dst.Vec[i] = dst.Data[i*cols : (i+1)*cols]
+	}
+	dst.Rows = rows
+	dst.Cols = cols
+	return dst
+}
+
 func Softmax(wm *Matrix) *Matrix {
 	if wm == nil || wm.Rows == 0 || wm.Cols == 0 {
 		return wm
@@ -66,23 +85,31 @@ func SoftmaxCopy(wm *Matrix) *Matrix {
 		return nil
 	}
 
-	out := NewZeroMatrix(wm.Rows, wm.Cols)
-	for i := 0; i < wm.Rows; i++ {
-		copy(out.Vec[i], wm.Vec[i])
-	}
-
+	out := wm.CloneInto(nil)
 	return Softmax(out)
 }
 
 func (wm *Matrix) Transpose() *Matrix {
-	n := NewZeroMatrix(wm.Cols, wm.Rows)
+	return wm.TransposeInto(nil)
+}
 
+func (wm *Matrix) TransposeInto(dst *Matrix) *Matrix {
+	n := ensureMatrix(dst, wm.Cols, wm.Rows)
 	for i := 0; i < n.Rows; i++ {
 		for j := 0; j < n.Cols; j++ {
 			n.Vec[i][j] = wm.Vec[j][i]
 		}
 	}
 	return n
+}
+
+func (wm *Matrix) CloneInto(dst *Matrix) *Matrix {
+	if wm == nil {
+		return nil
+	}
+	out := ensureMatrix(dst, wm.Rows, wm.Cols)
+	copy(out.Data, wm.Data)
+	return out
 }
 
 func (wm *Matrix) Dot(t *Matrix) []float32 {
@@ -103,13 +130,29 @@ func (wm *Matrix) Dot(t *Matrix) []float32 {
 }
 
 func (wm *Matrix) Mul(other *Matrix) *Matrix {
+	return wm.MulInto(nil, other)
+}
+
+// MulInto multiplies wm by other and stores the result in dst when possible.
+func (wm *Matrix) MulInto(dst, other *Matrix) *Matrix {
 	if wm == nil || other == nil {
 		return nil
 	}
 	if wm.Cols != other.Rows {
 		return nil
 	}
-	return mulNeon(wm, other)
+	return mulNeonInto(dst, wm, other)
+}
+
+// MulPackedInto multiplies wm by a reusable packed right-hand-side matrix.
+func (wm *Matrix) MulPackedInto(dst *Matrix, other *PackedMatrix) *Matrix {
+	if wm == nil || other == nil || other.Original == nil {
+		return nil
+	}
+	if wm.Cols != other.Original.Rows {
+		return nil
+	}
+	return mulNeonPackedIntoMatrix(dst, wm, other)
 }
 
 func (wm *Matrix) Add(other *Matrix) *Matrix {

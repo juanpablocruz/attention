@@ -1,8 +1,7 @@
 package matrix
 
-func mulGeneric(a, b *Matrix) *Matrix {
-	result := NewZeroMatrix(a.Rows, b.Cols)
-
+func mulGenericInto(dst, a, b *Matrix) *Matrix {
+	result := ensureMatrix(dst, a.Rows, b.Cols)
 	for i := 0; i < a.Rows; i++ {
 		for j := 0; j < b.Cols; j++ {
 			var sum float32

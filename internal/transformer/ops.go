@@ -52,6 +52,10 @@ func ScaledAttention(q *matrix.Matrix, k *matrix.Matrix, v *matrix.Matrix) *matr
 }
 
 func MultiHeadAttention(x *matrix.Matrix, block *TransformerBlock) (*matrix.Matrix, *MHACache, error) {
+	return MultiHeadAttentionPacked(x, block, nil)
+}
+
+func MultiHeadAttentionPacked(x *matrix.Matrix, block *TransformerBlock, packed *PackedBlock) (*matrix.Matrix, *MHACache, error) {
 	if x == nil || block == nil {
 		return nil, nil, fmt.Errorf("nil input for multi-head attention")
 	}
@@ -62,27 +66,51 @@ func MultiHeadAttention(x *matrix.Matrix, block *TransformerBlock) (*matrix.Matr
 	headOuts := make([]*matrix.Matrix, block.NumHeads)
 	headCaches := make([]HeadCache, block.NumHeads)
 	for h := 0; h < block.NumHeads; h++ {
-		q := x.Mul(block.WQ[h])
-		k := x.Mul(block.WK[h])
-		v := x.Mul(block.WV[h])
+		var q, k, v *matrix.Matrix
+		if packed != nil {
+			q = x.MulPackedInto(nil, packed.WQ[h])
+			k = x.MulPackedInto(nil, packed.WK[h])
+			v = x.MulPackedInto(nil, packed.WV[h])
+		} else {
+			q = x.Mul(block.WQ[h])
+			k = x.Mul(block.WK[h])
+			v = x.Mul(block.WV[h])
+		}
 
 		headOuts[h] = ScaledAttention(q, k, v)
 		headCaches[h] = HeadCache{Q: q, K: k, V: v}
 	}
 
 	concat := concatHeads(headOuts)
-	out := concat.Mul(block.WO)
+	var out *matrix.Matrix
+	if packed != nil {
+		out = concat.MulPackedInto(nil, packed.WO)
+	} else {
+		out = concat.Mul(block.WO)
+	}
 
 	return out, &MHACache{Input: x, Concat: concat, Heads: headCaches}, nil
 }
 
 func MultiHeadAttentionBackward(dOut *matrix.Matrix, cache *MHACache, block *TransformerBlock) (dWQ, dWK, dWV []*matrix.Matrix, dWO, dInput *matrix.Matrix, err error) {
+	return MultiHeadAttentionBackwardPacked(dOut, cache, block, nil)
+}
+
+func MultiHeadAttentionBackwardPacked(dOut *matrix.Matrix, cache *MHACache, block *TransformerBlock, packed *PackedBlock) (dWQ, dWK, dWV []*matrix.Matrix, dWO, dInput *matrix.Matrix, err error) {
 	if dOut == nil || cache == nil || block == nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("nil inputs for multi-head backward")
 	}
 
-	dWO = cache.Concat.Transpose().Mul(dOut)
-	dConcat := dOut.Mul(block.WO.Transpose())
+	concatT := cache.Concat.Transpose()
+	inputT := cache.Input.Transpose()
+
+	dWO = concatT.Mul(dOut)
+	var dConcat *matrix.Matrix
+	if packed != nil {
+		dConcat = dOut.MulPackedInto(nil, packed.WOTranspose)
+	} else {
+		dConcat = dOut.Mul(block.WO.Transpose())
+	}
 	dHeadOuts, splitErr := splitHeads(dConcat, block.NumHeads, block.HeadDim)
 	if splitErr != nil {
 		return nil, nil, nil, nil, nil, splitErr
@@ -96,13 +124,20 @@ func MultiHeadAttentionBackward(dOut *matrix.Matrix, cache *MHACache, block *Tra
 	for h := 0; h < block.NumHeads; h++ {
 		dQ, dK, dV := ScaledAttentionBackward(dHeadOuts[h], cache.Heads[h].Q, cache.Heads[h].K, cache.Heads[h].V)
 
-		dWQ[h] = cache.Input.Transpose().Mul(dQ)
-		dWK[h] = cache.Input.Transpose().Mul(dK)
-		dWV[h] = cache.Input.Transpose().Mul(dV)
+		dWQ[h] = inputT.Mul(dQ)
+		dWK[h] = inputT.Mul(dK)
+		dWV[h] = inputT.Mul(dV)
 
-		dXQ := dQ.Mul(block.WQ[h].Transpose())
-		dXK := dK.Mul(block.WK[h].Transpose())
-		dXV := dV.Mul(block.WV[h].Transpose())
+		var dXQ, dXK, dXV *matrix.Matrix
+		if packed != nil {
+			dXQ = dQ.MulPackedInto(nil, packed.WQTranspose[h])
+			dXK = dK.MulPackedInto(nil, packed.WKTranspose[h])
+			dXV = dV.MulPackedInto(nil, packed.WVTranspose[h])
+		} else {
+			dXQ = dQ.Mul(block.WQ[h].Transpose())
+			dXK = dK.Mul(block.WK[h].Transpose())
+			dXV = dV.Mul(block.WV[h].Transpose())
+		}
 
 		dInput.AddInPlace(dXQ)
 		dInput.AddInPlace(dXK)
@@ -203,7 +238,7 @@ func AddAndNormBackward(dOut, m, attention *matrix.Matrix) (dM, dAttention *matr
 		return nil, nil
 	}
 
-	return cloneMatrix(dResidual), cloneMatrix(dResidual)
+	return dResidual, dResidual
 }
 
 func layerNorm(residual *matrix.Matrix) *matrix.Matrix {
@@ -248,15 +283,27 @@ type FFNCache struct {
 }
 
 func ExpandWithCache(m, t, w *matrix.Matrix) (*matrix.Matrix, *FFNCache) {
-	preRelu := m.Mul(t)
+	return ExpandWithCachePacked(m, t, w, nil, nil)
+}
+
+func ExpandWithCachePacked(m, t, w *matrix.Matrix, packedT, packedW *matrix.PackedMatrix) (*matrix.Matrix, *FFNCache) {
+	var preRelu *matrix.Matrix
+	if packedT != nil {
+		preRelu = m.MulPackedInto(nil, packedT)
+	} else {
+		preRelu = m.Mul(t)
+	}
 
 	hidden := matrix.NewZeroMatrix(preRelu.Rows, preRelu.Cols)
-	for i := 0; i < preRelu.Rows; i++ {
-		copy(hidden.Vec[i], preRelu.Vec[i])
-	}
+	copy(hidden.Data, preRelu.Data)
 	hidden.ReLu()
 
-	m2 := hidden.Mul(w)
+	var m2 *matrix.Matrix
+	if packedW != nil {
+		m2 = hidden.MulPackedInto(nil, packedW)
+	} else {
+		m2 = hidden.Mul(w)
+	}
 	residual := m2.Add(m)
 	out := layerNorm(residual)
 
@@ -269,10 +316,21 @@ func ExpandWithCache(m, t, w *matrix.Matrix) (*matrix.Matrix, *FFNCache) {
 }
 
 func FFNBackward(dOut *matrix.Matrix, cache *FFNCache, w1, w2 *matrix.Matrix) (dW1, dW2, dInput *matrix.Matrix) {
-	dResidual := layerNormBackward(dOut, cache.Residual)
+	return FFNBackwardPacked(dOut, cache, w1, w2, nil, nil)
+}
 
-	dW2 = cache.Hidden.Transpose().Mul(dResidual)
-	dHidden := dResidual.Mul(w2.Transpose())
+func FFNBackwardPacked(dOut *matrix.Matrix, cache *FFNCache, w1, w2 *matrix.Matrix, packedW1T, packedW2T *matrix.PackedMatrix) (dW1, dW2, dInput *matrix.Matrix) {
+	dResidual := layerNormBackward(dOut, cache.Residual)
+	hiddenT := cache.Hidden.Transpose()
+	inputT := cache.Input.Transpose()
+
+	dW2 = hiddenT.Mul(dResidual)
+	var dHidden *matrix.Matrix
+	if packedW2T != nil {
+		dHidden = dResidual.MulPackedInto(nil, packedW2T)
+	} else {
+		dHidden = dResidual.Mul(w2.Transpose())
+	}
 
 	dPreRelu := matrix.NewZeroMatrix(dHidden.Rows, dHidden.Cols)
 	for i := 0; i < dHidden.Rows; i++ {
@@ -283,9 +341,14 @@ func FFNBackward(dOut *matrix.Matrix, cache *FFNCache, w1, w2 *matrix.Matrix) (d
 		}
 	}
 
-	dW1 = cache.Input.Transpose().Mul(dPreRelu)
+	dW1 = inputT.Mul(dPreRelu)
 
-	dInputLinear := dPreRelu.Mul(w1.Transpose())
+	var dInputLinear *matrix.Matrix
+	if packedW1T != nil {
+		dInputLinear = dPreRelu.MulPackedInto(nil, packedW1T)
+	} else {
+		dInputLinear = dPreRelu.Mul(w1.Transpose())
+	}
 	dInput = dInputLinear.Add(dResidual)
 
 	return dW1, dW2, dInput
@@ -335,15 +398,7 @@ func layerNormBackward(dOut, x *matrix.Matrix) *matrix.Matrix {
 }
 
 func cloneMatrix(m *matrix.Matrix) *matrix.Matrix {
-	if m == nil {
-		return nil
-	}
-
-	out := matrix.NewZeroMatrix(m.Rows, m.Cols)
-	for i := 0; i < m.Rows; i++ {
-		copy(out.Vec[i], m.Vec[i])
-	}
-	return out
+	return m.CloneInto(nil)
 }
 
 func SelectChoice(m *matrix.Matrix) []int {
