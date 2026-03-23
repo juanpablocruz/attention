@@ -86,7 +86,7 @@ func trainIntentEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath s
 			acc := float64(correct) / float64(max(trainSeen, 1))
 			elapsed := now.Sub(start)
 			rate := float64(processed) / elapsed.Seconds()
-			remaining := float64(totalRecords-processed) / maxFloat(rate, 1e-9)
+			remaining := float64(totalRecords-processed) / max(rate, 1e-9)
 			eta := time.Duration(remaining * float64(time.Second))
 			reporter.Render(now, processed, ProgressUpdate{
 				Loss:     avgLoss,

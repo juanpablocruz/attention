@@ -137,7 +137,7 @@ func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string,
 			tokenAcc := float64(totalCorrect) / float64(max(totalTokens, 1))
 			elapsed := now.Sub(start)
 			rate := float64(seen) / elapsed.Seconds()
-			remaining := float64(totalRecords-seen) / maxFloat(rate, 1e-9)
+			remaining := float64(totalRecords-seen) / max(rate, 1e-9)
 			eta := time.Duration(remaining * float64(time.Second))
 			reporter.Render(now, seen, ProgressUpdate{
 				Loss:     avgLoss,
@@ -187,11 +187,4 @@ func trainEpoch(ctx context.Context, epoch, totalEpochs int, datasetPath string,
 	}
 
 	return totalLoss / float64(seen), float64(totalCorrect) / float64(totalTokens), seen, sortAcc, sumAcc, totalSortSamples, totalSumSamples, canceled, nil
-}
-
-func maxFloat(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
 }
